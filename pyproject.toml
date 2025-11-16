@@ -1,0 +1,72 @@
+[tool.poetry]
+name = "bybit-algo-grid"
+version = "0.1.0"
+description = "Bybit Algo-Grid System / AVI-5 strategy backend"
+authors = ["Bybit Algo Team <dev@example.com>"]
+readme = "README.md"
+# Используем пакет src.* как корневой (см. импорты вида `src.main:app`)
+packages = [{ include = "src" }]
+
+[tool.poetry.dependencies]
+python = "^3.12"
+
+# Основной стек backend'a
+fastapi = "*"
+uvicorn = { version = "*", extras = ["standard"] }
+
+# Работа с БД и миграциями
+asyncpg = "*"
+alembic = "*"
+
+# Redis / кеш / pub-sub
+redis = "*"
+
+# Логирование и конфиг
+structlog = "*"
+PyYAML = "*"
+
+# Валидация и модели
+pydantic = "*"
+
+# HTTP-клиент (Bybit REST, Vault, S3 совместимый API и т.п.)
+aiohttp = "*"
+
+# Планировщик задач (walk-forward калибровка и периодические джобы)
+apscheduler = "*"
+
+# Метрики и мониторинг
+prometheus_client = "*"
+
+# AWS / S3 (backup & restore)
+boto3 = "*"
+
+# Аутентификация / JWT
+PyJWT = "*"
+
+# CLI-утилиты
+tqdm = "*"
+
+# Явно фиксируем starlette, хотя fastapi её подтянет
+starlette = "*"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "*"
+pytest-asyncio = "*"
+ruff = "*"
+mypy = "*"
+
+[tool.poetry.scripts]
+# Запуск миграций БД через CLI-обёртку (см. `scripts/migrate.py`)
+migrate = "scripts.migrate:main"
+
+# Запуск тестов (эквивалент `pytest`)
+test = "pytest:main"
+
+# Согласно спецификации планируется скрипт dev = "docker-compose up".
+# Реализовать его корректно через Poetry можно либо через отдельный Python-скрипт,
+# который вызывает docker-compose, либо через task-раннер (taskipy/poethepoet).
+# Это оставлено как TODO, чтобы не добавлять несогласованные файлы.
+
+[build-system]
+requires = ["poetry-core>=1.5.0"]
+build-backend = "poetry.core.masonry.api"
