@@ -1,0 +1,120 @@
+name: CI
+
+on:
+  push:
+
+jobs:
+  lint:
+    name: Lint & type-check
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Poetry
+        uses: snok/install-poetry@v1
+        with:
+          version: 1.8.3
+          virtualenvs-create: true
+          virtualenvs-in-project: true
+
+      - name: Install dependencies
+        run: poetry install --no-interaction --no-ansi --with dev
+
+      - name: Run ruff (lint)
+        run: poetry run ruff check .
+
+      - name: Run mypy (type-check)
+        run: poetry run mypy src
+
+  test:
+    name: Test (pytest)
+    runs-on: ubuntu-latest
+    needs: lint
+
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: avi5
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U postgres"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=5
+
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd="redis-cli ping || exit 1"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=5
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Poetry
+        uses: snok/install-poetry@v1
+        with:
+          version: 1.8.3
+          virtualenvs-create: true
+          virtualenvs-in-project: true
+
+      - name: Install dependencies
+        run: poetry install --no-interaction --no-ansi --with dev
+
+      - name: Wait for PostgreSQL & Redis
+        run: |
+          python - << 'PY'
+          import socket, time
+
+          def wait(host: str, port: int, retries: int = 30) -> None:
+              for _ in range(retries):
+                  try:
+                      with socket.create_connection((host, port), timeout=2):
+                          return
+                  except OSError:
+                      time.sleep(2)
+              raise SystemExit(f"Service {host}:{port} not available")
+
+          wait("localhost", 5432)
+          wait("localhost", 6379)
+          PY
+
+      - name: Run pytest
+        env:
+          # Эти значения согласованы с локальной dev-конфигурацией (alembic.ini / settings.yaml)
+          DATABASE_URL: postgresql+asyncpg://postgres:postgres@localhost:5432/avi5
+          REDIS_URL: redis://localhost:6379/0
+        run: poetry run pytest
+
+  build:
+    name: Build Docker image
+    runs-on: ubuntu-latest
+    needs: test
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Build Docker image
+        run: docker build -f docker/Dockerfile -t bybit-algo-grid:ci .
