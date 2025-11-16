@@ -476,9 +476,7 @@ CREATE UNIQUE INDEX idx_api_keys_user_label
 
 CREATE INDEX idx_api_keys_user_active
     ON api_keys (user_id, is_active);
-````
 
-```sql
 CREATE TABLE signals (
     id UUID PRIMARY KEY,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -522,9 +520,7 @@ CREATE TABLE positions (
 
 CREATE INDEX idx_positions_symbol_status
     ON positions (symbol, status);
-```
 
-```sql
 CREATE TABLE audit_trail (
     id BIGSERIAL PRIMARY KEY,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -535,9 +531,7 @@ CREATE TABLE audit_trail (
 
 CREATE INDEX idx_audit_trail_user
     ON audit_trail (user_id, created_at);
-```
 
-```sql
 CREATE TABLE reconciliation_log (
     id BIGSERIAL PRIMARY KEY,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -566,8 +560,6 @@ CREATE TABLE order_rejections (
 * На продакшене действует строгий запрет на ручные изменения схемы БД в обход миграций.
 * Документация по схеме и миграциям ведётся в `docs/database_schema.md`.
 
-```
-
 ## 4. [ASSUMPTION] — ТЕХНИЧЕСКИЕ ДОПУЩЕНИЯ
 
 | ID | Допущение | Обоснование |
@@ -591,21 +583,21 @@ CREATE TABLE order_rejections (
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                               USER UI (Vanilla JS)                           │
-│                      (SSE → /stream, REST → /api/v1)                         │
+│                               USER UI (Vanilla JS)                          │
+│                      (SSE → /stream, REST → /api/v1)                        │
 └─────────────────────────────┬───────────────────────────────────────────────┘
                               │
-┌─────────────────────────────▼───────────────────────────────────────────────┐
-│                        FASTAPI API GATEWAY (uvicorn)                        │
-│  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐      │
-│  │ /signals │  │ /positions│  │ /config  │  │ /health  │  │ /metrics │ ...  │
-│  └────┬─────┘  └────┬─────┘  └────┬─────┘  └────┬─────┘  └────┬─────┘      │
-│       │             │             │             │             │              │
-└───────│─────────────│─────────────│─────────────│─────────────│──────────────┘
-        │             │             │             │             │
-        │             │             │             │             │
-┌───────▼─────────────▼─────────────▼─────────────▼─────────────▼──────────────┐
-│                        CORE BUSINESS LAYER (async)                          │
+┌─────────────────────────────▼─────────────────────────────────────────────────┐
+│                        FASTAPI API GATEWAY (uvicorn)                          │
+│  ┌──────────┐  ┌───────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐        │
+│  │ /signals │  │ /positions│  │ /config  │  │ /health  │  │ /metrics │ ...    │
+│  └────┬─────┘  └────┬──────┘  └────┬─────┘  └────┬─────┘  └────┬─────┘        │
+│       │             │              │             │             │              │
+└───────│─────────────│──────────────│─────────────│─────────────│──────────────┘
+        │             │              │             │             │
+        │             │              │             │             │
+┌───────▼─────────────▼──────────────▼─────────────▼─────────────▼──────────────┐
+│                        CORE BUSINESS LAYER (async)                            │
 │  ┌──────────────────┐  ┌──────────────────┐  ┌──────────────────┐          │
 │  │ StrategyEngine   │  │ RiskManager      │  │ OrderManager     │          │
 │  │   (AVI‑5)        │  │   (Limits, BE)   │  │   (Manual)       │          │
@@ -789,7 +781,6 @@ bybit-algo-grid/
 ├── README.md                         # Quick start, архитектура
 └── alembic.ini                       # Alembic миграции
 ```
-
 ---
 
 ## 7. ВНУТРЕННЯЯ СТРУКТУРА ФАЙЛОВ: КЛАССЫ, ФУНКЦИИ, ИМПОРТЫ
