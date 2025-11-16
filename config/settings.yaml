@@ -1,0 +1,13 @@
+# config/settings.yaml
+
+trading:
+  # Максимальный размер позиции (stake) для стратегии AVI-5 в базовой валюте счёта.
+  max_stake: 100
+
+risk:
+  # Максимальное количество одновременных открытых позиций.
+  max_concurrent: 5
+
+bybit:
+  # Публичная часть Bybit API key, берётся из переменной окружения.
+  api_key: "${BYBIT_API_KEY}"
