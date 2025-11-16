@@ -1,0 +1,67 @@
+version: "3.9"
+
+services:
+  db:
+    image: postgres:15-alpine
+    container_name: avi5-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: avi5
+      POSTGRES_USER: avi5
+      POSTGRES_PASSWORD: avi5
+    ports:
+      - "5432:5432"
+    volumes:
+      - db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U avi5"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: avi5-redis
+    restart: unless-stopped
+    # Для dev нам не нужна долговременная персистентность Redis
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  app:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: avi5-app
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    # Локальные секреты для dev/sandbox (не коммитятся),
+    # шаблон лежит в config/secrets.env.example
+    env_file:
+      - ../config/secrets.env
+    environment:
+      APP_ENV: "dev"
+      # URLы для коннекта к БД и Redis из приложения
+      DATABASE_URL: "postgresql+asyncpg://avi5:avi5@db:5432/avi5"
+      REDIS_URL: "redis://redis:6379/0"
+    ports:
+      - "8000:8000"
+    working_dir: /app
+    # при желании можно раскомментировать volume для live-редакции кода
+    # volumes:
+    #   - ..:/app:rw
+
+volumes:
+  db_data:
+  redis_data:
