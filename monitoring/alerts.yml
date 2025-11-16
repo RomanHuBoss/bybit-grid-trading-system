@@ -1,0 +1,89 @@
+groups:
+  # Технические алерты по инфраструктуре
+  - name: bybit-algo-grid-tech
+    rules:
+      # no_ws_data — нет свечей > N минут
+      - alert: NoWSData
+        expr: |
+          sum(
+            rate(bybit_ws_kline_messages_total{job="bybit-algo-grid"}[5m])
+          ) == 0
+        for: 5m
+        labels:
+          severity: critical
+          category: ws
+          alert_code: no_ws_data
+          service: bybit-algo-grid
+        annotations:
+          summary: "Нет WebSocket kline-данных более 5 минут"
+          description: >
+            Prometheus не видит входящих kline-сообщений Bybit WebSocket
+            дольше 5 минут. Торговая логика может работать на устаревших
+            данных. Проверьте соединение с Bybit WS, collector и Redis Streams.
+          runbook: "docs/runbooks/no_ws_data.md"
+
+      # high_error_rate_bybit — рост 5xx/4xx по Bybit API
+      - alert: HighErrorRateBybit
+        expr: |
+          (
+            sum(
+              rate(bybit_http_requests_total{job="bybit-algo-grid",status=~"4..|5.."}[5m])
+            )
+            /
+            sum(
+              rate(bybit_http_requests_total{job="bybit-algo-grid"}[5m])
+            )
+          ) > 0.05
+        for: 10m
+        labels:
+          severity: warning
+          category: bybit
+          alert_code: high_error_rate_bybit
+          service: bybit-algo-grid
+        annotations:
+          summary: "Высокий error-rate Bybit HTTP API"
+          description: >
+            Доля запросов к Bybit HTTP API с ответами 4xx/5xx превысила 5%
+            за последние 10 минут. Возможны проблемы на стороне Bybit или
+            некорректные параметры запросов. Проверьте логи интеграции
+            и статус Bybit.
+          runbook: "docs/runbooks/high_error_rate_bybit.md"
+
+      # db_replication_lag — лаг репликации PostgreSQL
+      - alert: DBReplicationLag
+        expr: pg_replication_lag_seconds{job="bybit-algo-grid-db"} > 10
+        for: 5m
+        labels:
+          severity: warning
+          category: db
+          alert_code: db_replication_lag
+          service: bybit-algo-grid
+        annotations:
+          summary: "Лаг репликации PostgreSQL превышает 10 секунд"
+          description: >
+            Метрика pg_replication_lag_seconds показывает отставание реплики
+            базы данных более чем на 10 секунд. Возможны устаревшие данные
+            при чтении с реплики и риск потери RPO при аварии. Проверьте
+            состояние primary/replica, диски и сеть.
+          runbook: "docs/runbooks/db_replication_lag.md"
+
+  # Бизнес-алерты / состояние торговли
+  - name: bybit-algo-grid-business
+    rules:
+      # kill_switch_triggered — срабатывание kill-switch
+      - alert: KillSwitchTriggered
+        expr: kill_switch_active{job="bybit-algo-grid"} == 1
+        for: 1m
+        labels:
+          severity: critical
+          category: trading
+          alert_code: kill_switch_triggered
+          service: bybit-algo-grid
+        annotations:
+          summary: "Активирован торговый kill-switch"
+          description: >
+            Флаг kill_switch_active установлен в 1. Генерация торговых сигналов
+            остановлена согласно защитной логике. Необходимо проверить причины
+            срабатывания (метрики стратегии, ошибки интеграций, ручное
+            вмешательство) и следовать соответствующему runbook.
+          runbook: "docs/runbooks/kill_switch_triggered.md"
