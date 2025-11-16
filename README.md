@@ -78,7 +78,7 @@ bybit-algo-grid/
 
 ### 1. Требования
 
-* Python **3.11+**
+* Python **3.12+**
 * [Poetry](https://python-poetry.org/) (менеджер зависимостей)
 * Docker + Docker Compose
 * Доступ к тестовой среде Bybit (testnet) и отдельной тестовой БД PostgreSQL (если используете не docker-compose).

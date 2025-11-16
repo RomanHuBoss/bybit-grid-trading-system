@@ -44,7 +44,7 @@
 
 ### Технический стек
 
-- Backend: Python 3.11+, FastAPI, asyncpg, redis-py, structlog.
+- Backend: Python 3.12+, FastAPI, asyncpg, redis-py, structlog.
 - DB: PostgreSQL 15+ с расширением TimescaleDB для time-series.
 - Message-layer / кеш: Redis 7+.
 - CI/CD: GitHub Actions, Docker, (Kubernetes / Docker-compose — в зависимости от окружения).
@@ -572,7 +572,7 @@ CREATE TABLE order_rejections (
 
 | ID | Допущение | Обоснование |
 |----|-----------|-------------|
-| **A‑01** | **Язык — Python 3.11+**, async‑first (aiohttp, asyncio). | ТЗ явно указывает Python, современные версии дают лучшую производительность async‑кода. |
+| **A‑01** | **Язык — Python 3.12+**, async‑first (aiohttp, asyncio). | ТЗ явно указывает Python, современные версии дают лучшую производительность async‑кода. |
 | **A‑02** | **FastAPI запускается с Uvicorn**, 4+ worker‑процесса (от CPU‑cores). | Достижение p95 latency <5с при параллельной обработке multiple WS‑каналов. |
 | **A‑03** | **PostgreSQL 15+ с TimescaleDB extension** для гипертейблов `klines_*`, `signals`. | TimescaleDB оптимизировано для временных рядов, что соответствует спеке. |
 | **A‑04** | **Redis 7+**, используются Streams (для очереди сигналов) и pub/sub (для realtime UI). | Streams обеспечивают durable queue, pub/sub — низкую латентность для SSE. |
@@ -1870,12 +1870,12 @@ OrderManager обязан обрабатывать частичное испол
 
 | Инструкция | Описание |
 |------------|----------|
-| `FROM python:3.11-slim as builder` | Базовый образ для сборки. |
+| `FROM python:3.12-slim as builder` | Базовый образ для сборки. |
 | `RUN pip install poetry` | Установка Poetry. |
 | `COPY pyproject.toml poetry.lock ./` | Копирование зависимостей. |
 | `RUN poetry export -f requirements.txt -o requirements.txt` | Генерация requirements. |
 | `RUN pip install --user -r requirements.txt` | Установка в локальное окружение. |
-| `FROM python:3.11-slim as runtime` | Финальный образ. |
+| `FROM python:3.12-slim as runtime` | Финальный образ. |
 | `COPY --from=builder /root/.local /root/.local` | Копирование установленных пакетов. |
 | `COPY . /app` | Копирование кода. |
 | `WORKDIR /app` | Рабочая директория. |
