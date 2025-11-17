@@ -106,6 +106,17 @@ class WebhookError(AlgoGridBaseException):
     """
     pass
 
+class WebhookHTTPError(AlgoGridBaseException):
+    """
+    Ошибка при отправке вебхука.
+
+    Примеры:
+        - сетевые/транспортные ошибки,
+        - неуспешный HTTP-статус,
+        - ошибки формирования или подписи полезной нагрузки.
+    """
+    pass
+
 
 class DatabaseError(AlgoGridBaseException):
     """
