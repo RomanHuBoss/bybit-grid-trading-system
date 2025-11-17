@@ -152,3 +152,9 @@ class WSConnectionError(AlgoGridBaseException):
         - протокольные или аутентификационные ошибки.
     """
     pass
+
+class NetworkError(AlgoGridBaseException):
+    """
+    Ошибка работы с сетью в контексте BybitRESTClient
+    """
+    pass

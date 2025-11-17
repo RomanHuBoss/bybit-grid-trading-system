@@ -314,3 +314,57 @@ def _sanitize_context(context: Mapping[str, Any]) -> Dict[str, Any]:
         else:
             result[key] = repr(value)
     return result
+
+
+def raise_for_bybit_rest_error(
+    payload: Mapping[str, Any],
+    *,
+    http_status: Optional[int] = None,
+    context: Optional[Mapping[str, Any]] = None,
+) -> None:
+    """
+    Обёртка для BybitRESTClient: по JSON-ответу решает,
+    надо ли бросать исключение.
+
+    * Если ответ успешный (retCode/ret_code == 0) — просто возвращает None.
+    * Если ошибка — вызывает handle_api_error(...) и бросает исключение.
+    """
+    # Нормализуем retCode / retMsg
+    if not isinstance(payload, Mapping):
+        error_code: Optional[Union[int, str]] = None
+        error_msg = "Non-mapping payload from Bybit REST"
+    else:
+        error_code = payload.get("retCode", payload.get("ret_code"))
+        error_msg = str(
+            payload.get("retMsg")
+            or payload.get("ret_msg")
+            or payload.get("msg")
+            or ""
+        )
+
+    ctx: Dict[str, Any] = dict(context or {})
+
+    # Чтобы _extract_http_status увидел http_status
+    if http_status is not None:
+        ctx.setdefault("http_status", http_status)
+
+    # У тебя в контексте из REST-клиента передаётся url; для метрик
+    # _record_rate_limit_hit смотрит на endpoint/path, добавим алиас.
+    if "endpoint" not in ctx and "url" in ctx:
+        ctx["endpoint"] = str(ctx["url"])
+
+    action = handle_api_error(error_code, error_msg, ctx)
+
+    # Успех — ничего не делаем, просто возвращаемся.
+    if action.code is BybitErrorCode.SUCCESS:
+        return
+
+    # На этом уровне можно сделать более красивый доменный exception,
+    # но без знания src.core.exceptions безопаснее не гадать.
+    # Делаем информативный RuntimeError, который уже можно перехватывать выше.
+    raise RuntimeError(
+        f"Bybit REST error: code={error_code!r}, "
+        f"msg={error_msg or action.user_message}, "
+        f"type={action.code.value}, "
+        f"retry={action.retry}"
+    )
