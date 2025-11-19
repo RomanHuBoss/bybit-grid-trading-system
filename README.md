@@ -1,5 +1,7 @@
 # Bybit Algo-Grid System / стратегия AVI-5
 
+<img src="logo.jpg" alt="Bybit Algo-Grid System / стратегия AVI-5" width="300"/>
+
 Система реализует полуавтоматическую **grid-/swing-стратегию** для деривативов Bybit (AVI-5):
 
 - **На вход**: рыночные данные (свечи 5m/15m, стакан L2/L50, trade-tape), открытые позиции и параметры стратегии.
