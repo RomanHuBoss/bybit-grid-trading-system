@@ -189,10 +189,11 @@ class RedisDistributedLock:
         try:
             res = await self._redis.eval(
                 _RELEASE_SCRIPT,
-                numkeys=1,
-                keys=[self._key],
-                args=[self._value],
+                1,  # numkeys
+                self._key,  # KEYS[1]
+                self._value,  # ARGV[1]
             )
+
             logger.debug(
                 "Distributed lock released",
                 key=self._key,
