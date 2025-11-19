@@ -256,32 +256,3 @@ poetry run uvicorn src.main:app --reload
 Эти документы описывают продакшн-процессы, SLA, процедуры восстановления и риск-ограничения и дополняют краткий обзор из данного README.
 
 ```
-
----
-
-### 3. Self-check
-
-**1) Соответствие спецификации**
-
-- README содержит **Quick start** с перечисленными в спецификации шагами: `pip install poetry`, `poetry install`, `docker-...se up` (конкретизировано как `docker-compose -f docker/docker-compose.yml up --build`), `alembic upgrade head`, `uvicorn src.main:app --reload`.
-- Добавлен краткий, но точный **обзор архитектуры**, опирающийся на high-level диаграмму из раздела 5: FastAPI-gateway, core-слой (StrategyEngine, RiskManager, OrderManager, индикаторы), интеграции с Bybit/Redis/PostgreSQL, monitoring.
-- Явно и чётко сформулирована **разница dev vs prod по секретам**, как требует Q-02: в dev допускается `.env` / `config/secrets.env`, в prod — только Vault/Transit, ciphertext в БД и аудит операций.
-- README ссылается на существующие артефакты (`config/`, `docs/`, `docker/`, `scripts/`, `alembic/`), не вводя новых сущностей и не меняя архитектурные решения.
-
-**2) Зависимости (по смыслу, а не по import)**
-
-- `config/settings.yaml` — упомянут как источник параметров приложения (trading/risk/bybit), с которыми работает backend.
-- `config/secrets.env.example` / `config/secrets.env` — демонстрируют, как задаются секреты в dev/test.
-- `docker/docker-compose.yml` и `docker/docker-compose.prod.yml` — точка запуска dev и prod стеков.
-- `pyproject.toml` — источник Poetry-зависимостей и scripts (`migrate`, `test`, `dev`), на которые README ссылается.
-- `scripts/migrate.py`, `alembic.ini`, `alembic/` — описаны как механизм миграций БД.
-- `docs/*.md` — упомянуты как расширенная документация (API, deployment, DR, backup, risk disclaimer).
-- Директории `src/` и `frontend/` — указаны как места расположения backend и UI соответственно.
-
-**3) TODO / ограничения**
-
-- Конкретные URL репозитория, окружений и CI-pipeline не указаны умышленно — они не заданы в спецификации, и их нужно будет добавить, когда появится фактическая инфраструктура.
-- Формулировки по путям эндпоинтов (`/api/v1/...`, `/ui`, `/metrics`) основаны на архитектурном описании и типичных для FastAPI паттернах; при реализации роутов их стоит перепроверить по `docs/api.md`.
-- Для команд `poetry run migrate`, `poetry run dev` README ссылается на `pyproject.toml`, но не фиксирует жёсткие сигнатуры — если названия scripts там изменятся, нужно будет обновить соответствующий раздел.
-- Подробная схема продакшн-стека (Traefik, реплики, Vault-интеграция) вынесена в `docs/deployment.md`; README сознательно держится на уровне overview, чтобы не дублировать и не расходиться со спеком.
-```
