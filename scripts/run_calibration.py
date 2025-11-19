@@ -36,7 +36,6 @@ def _resolve_db_dsn(config: Any) -> str:
     """
     db_section = getattr(config, "db", None)
 
-    # Pydantic-модель или dict — поддерживаем оба варианта.
     def _get_from_section(section: Any, name: str) -> Optional[str]:
         if section is None:
             return None
@@ -88,7 +87,6 @@ def _resolve_redis_dsn(config: Any) -> str:
     if env_url:
         return env_url
 
-    # Пробуем собрать URL из host/port/db, если они есть в конфиге.
     host = _get_from_section(redis_section, "host") or "localhost"
     port = _get_from_section(redis_section, "port") or 6379
     db = _get_from_section(redis_section, "db") or 0
@@ -113,8 +111,6 @@ def _create_signal_repository(pool: asyncpg.Pool) -> SignalRepository:
       - рефлексируем сигнатуру SignalRepository;
       - если есть аргумент pool / db_pool / conn — используем его;
       - иначе пробуем передать пул позиционно.
-
-    Такой подход остаётся совместимым с существующей реализацией.
     """
     sig = inspect.signature(SignalRepository)  # type: ignore[call-arg]
     params = sig.parameters
@@ -129,7 +125,7 @@ def _create_signal_repository(pool: asyncpg.Pool) -> SignalRepository:
 
     if kwargs:
         return SignalRepository(**kwargs)  # type: ignore[call-arg]
-    # Фоллбек — передаём пул как первый позиционный аргумент.
+
     return SignalRepository(pool)  # type: ignore[call-arg]
 
 
@@ -172,15 +168,20 @@ async def _run_calibration(symbol: Optional[str], force: bool) -> None:
         # 1. Если не force — сначала проверяем PSI-дрифт
         if not force:
             psi, ok = await service.check_psi_drift(symbol=symbol)
+
             if psi is not None:
-                logger.info(
-                    "PSI drift computed",
-                    extra={
-                        "psi": str(psi),
-                        "psi_threshold": str(service._params.psi_threshold),  # noqa: SLF001
-                        "is_ok": ok,
-                    },
-                )
+                extra: dict[str, Any] = {
+                    "psi": str(psi),
+                    "is_ok": ok,
+                }
+
+                # Пытаемся взять публичный threshold, но без доступа к приватным полям.
+                threshold = getattr(service, "psi_threshold", None)
+                if threshold is not None:
+                    extra["psi_threshold"] = str(threshold)
+
+                logger.info("PSI drift computed", extra=extra)
+
                 if ok:
                     logger.info(
                         "PSI в норме, калибровка не требуется; завершаем без recalibrate()"
@@ -195,7 +196,6 @@ async def _run_calibration(symbol: Optional[str], force: bool) -> None:
         # 2. Собственно калибровка
         theta_map = await service.calibrate(symbol=symbol)
 
-        # Красиво логируем карту theta по часам
         for hour in range(24):
             value = theta_map.get(hour)
             logger.info("Theta[%02d] = %s", hour, value)
@@ -203,7 +203,6 @@ async def _run_calibration(symbol: Optional[str], force: bool) -> None:
         logger.info("Calibration job completed successfully")
 
     finally:
-        # Аккуратно закрываем ресурсы
         if pool is not None:
             await pool.close()
         if redis is not None:
