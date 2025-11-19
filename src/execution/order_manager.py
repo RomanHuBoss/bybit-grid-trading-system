@@ -4,7 +4,7 @@ import asyncio
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple, Mapping
 from uuid import UUID
 
 from src.core.logging_config import get_logger
@@ -437,7 +437,6 @@ class OrderManager:
             size_quote=size_quote,
             fill_ratio=fill_ratio,
             slippage=slippage_bps,
-            realized_pnl=Decimal("0"),
             funding=Decimal("0"),
         )
 
@@ -466,7 +465,7 @@ class OrderManager:
         return qty
 
     @staticmethod
-    def _extract_order_id(resp: Dict[str, Any]) -> Optional[str]:
+    def _extract_order_id(resp: Mapping[str, Any]) -> Optional[str]:
         """
         Извлечь orderId из ответа Bybit `POST /v5/order/create`.
 
@@ -481,7 +480,7 @@ class OrderManager:
         return None
 
     @staticmethod
-    def _extract_order_data(resp: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    def _extract_order_data(resp: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
         """
         Извлечь описание ордера из ответа Bybit `GET /v5/order/realtime`.
 
