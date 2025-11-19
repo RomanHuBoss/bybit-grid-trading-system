@@ -1,0 +1,224 @@
+/* frontend/static/css/styles.css
+ *
+ * Лёгкий слой поверх Tailwind (CDN) для общих мелочей:
+ * - сглаживание шрифтов и selection-цвет
+ * - аккуратный скроллбар в зоне тайлов
+ * - состояния индикаторов (connection / kill-switch) через data-атрибуты
+ * - небольшие доработки модального окна
+ */
+
+/* =========
+ * Базовые настройки
+ * ========= */
+
+html {
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+body {
+  text-rendering: optimizeLegibility;
+}
+
+/* Цвет выделения текста */
+::selection {
+  background-color: rgba(45, 212, 191, 0.35); /* близко к emerald-400/500 */
+  color: #f9fafb;
+}
+
+/* =========
+ * Скроллбар тайлов (и любых контейнеров со скроллом)
+ * ========= */
+
+#tiles-container {
+  /* немного более плавный скролл на десктопе */
+  scroll-behavior: smooth;
+}
+
+/* WebKit-скроллбар (Chrome, Edge, Safari) */
+#tiles-container::-webkit-scrollbar {
+  width: 6px;
+}
+
+#tiles-container::-webkit-scrollbar-track {
+  background-color: rgba(15, 23, 42, 0.7); /* slate-900-ish */
+}
+
+#tiles-container::-webkit-scrollbar-thumb {
+  background-color: rgba(51, 65, 85, 0.9); /* slate-700/800 */
+  border-radius: 9999px;
+}
+
+#tiles-container::-webkit-scrollbar-thumb:hover {
+  background-color: rgba(71, 85, 105, 1); /* slate-600/700 */
+}
+
+/* Firefox */
+#tiles-container {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(71, 85, 105, 1) rgba(15, 23, 42, 0.7);
+}
+
+/* Немного воздушности на совсем маленьких экранах */
+@media (max-width: 640px) {
+  #tiles-container {
+    min-height: 280px;
+  }
+}
+
+/* =========
+ * Индикатор подключения (header: #connection-status)
+ *
+ * JS может выставлять data-state="connecting" | "ok" | "error" на корневом элементе.
+ * Первый span (точка) и второй span (текст) стилизуем из одного места.
+ * ========= */
+
+#connection-status {
+  transition: color 0.15s ease, opacity 0.15s ease;
+}
+
+/* общая точка-индикатор */
+#connection-status > span:first-child {
+  transition: background-color 0.15s ease, box-shadow 0.15s ease;
+  box-shadow: 0 0 0 0 rgba(16, 185, 129, 0); /* reset */
+}
+
+/* Connecting */
+#connection-status[data-state="connecting"] > span:first-child {
+  background-color: #facc15; /* yellow-400 */
+  box-shadow: 0 0 0 2px rgba(250, 204, 21, 0.25);
+}
+
+#connection-status[data-state="connecting"] > span:last-child {
+  color: #e5e7eb; /* gray-200-ish */
+}
+
+/* OK */
+#connection-status[data-state="ok"] > span:first-child {
+  background-color: #22c55e; /* green-500 */
+  box-shadow: 0 0 0 2px rgba(34, 197, 94, 0.35);
+}
+
+#connection-status[data-state="ok"] > span:last-child {
+  color: #bbf7d0; /* green-200-ish */
+}
+
+/* Error / disconnected */
+#connection-status[data-state="error"] > span:first-child {
+  background-color: #ef4444; /* red-500 */
+  box-shadow: 0 0 0 2px rgba(239, 68, 68, 0.35);
+}
+
+#connection-status[data-state="error"] > span:last-child {
+  color: #fecaca; /* red-200-ish */
+}
+
+/* =========
+ * Kill-switch indicator (#kill-switch-indicator)
+ *
+ * Аналогично, main.js может ставить data-state="ok" | "tripped".
+ * ========= */
+
+#kill-switch-indicator {
+  transition: background-color 0.15s ease, color 0.15s ease, border-color 0.15s ease;
+  border: 1px solid transparent;
+}
+
+#kill-switch-indicator[data-state="ok"] {
+  background-color: rgba(15, 118, 110, 0.2); /* teal-ish */
+  color: #a7f3d0; /* emerald-200-ish */
+  border-color: rgba(16, 185, 129, 0.5);
+}
+
+#kill-switch-indicator[data-state="ok"] > span:first-child {
+  background-color: #22c55e; /* зелёная точка */
+}
+
+/* Сработавший kill-switch */
+#kill-switch-indicator[data-state="tripped"] {
+  background-color: rgba(127, 29, 29, 0.5); /* dark red */
+  color: #fecaca; /* red-200 */
+  border-color: rgba(248, 113, 113, 0.7); /* red-400 */
+}
+
+#kill-switch-indicator[data-state="tripped"] > span:first-child {
+  background-color: #ef4444; /* красная точка */
+}
+
+/* =========
+ * Модальное окно (#modal-container + контент от ModalController)
+ * ========= */
+
+/* Небольшой fade-in/out при переключении hidden/flex.
+ * hidden от Tailwind ставит display: none, так что анимация применяется
+ * в тот момент, когда контейнер уже "flex". */
+#modal-container {
+  opacity: 0;
+  transition: opacity 0.15s ease;
+}
+
+/* Когда JS добавляет класс flex (и убирает hidden),
+ * контейнер видим — чуть поднимаем прозрачность. */
+#modal-container.flex {
+  opacity: 1;
+}
+
+/* Внутренняя карточка модала — мягкая тень и лёгкая анимация появления */
+#modal-container [data-modal-root] {
+  transform: translateY(4px) scale(0.99);
+  transition: transform 0.16s ease-out, box-shadow 0.16s ease-out;
+  box-shadow:
+    0 22px 45px rgba(15, 23, 42, 0.9),
+    0 0 0 1px rgba(15, 23, 42, 0.8);
+}
+
+#modal-container.flex [data-modal-root] {
+  transform: translateY(0) scale(1);
+}
+
+/* Таблица уровней: сглаживаем границы, чтобы они выглядели аккуратнее
+ * рядом с Tailwind-классами. */
+#modal-container table {
+  border-collapse: collapse;
+}
+
+#modal-container thead tr {
+  backdrop-filter: blur(6px);
+}
+
+#modal-container tbody tr:hover {
+  background-color: rgba(15, 23, 42, 0.9); /* чуть более светлый slate */
+}
+
+/* Текст комментария — ограничиваем высоту и добавляем скролл, если нужно */
+#modal-container [data-comment] {
+  max-height: 96px;
+  overflow-y: auto;
+}
+
+/* =========
+ * Мелкие утилиты для текста/чипов (могут использоваться из JS при необходимости)
+ * ========= */
+
+.badge-soft {
+  border-radius: 9999px;
+  padding: 2px 8px;
+  font-size: 11px;
+  line-height: 1.2;
+  border: 1px solid rgba(51, 65, 85, 1); /* slate-700 */
+  background-color: rgba(15, 23, 42, 0.9);
+  color: #e5e7eb; /* gray-200 */
+}
+
+/* long / short акценты для возможных бейджей */
+.badge-long {
+  background-color: rgba(16, 185, 129, 0.12); /* emerald-500/10 */
+  color: #6ee7b7; /* emerald-300 */
+  border-color: rgba(16, 185, 129, 0.6);
+}
+
+.badge-short {
+  background-color: rgba(239, 68, 68, 0.12); /* red-500/10 */
+  color: #fecaca; /* red-200 */
+  border-color: rgba(239, 68, 68, 0.7);
+}
