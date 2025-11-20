@@ -1,0 +1,20 @@
+{
+  "topic": "kline.5.BTCUSDT",
+  "type": "snapshot",
+  "ts": 1717074600000,
+  "data": [
+    {
+      "symbol": "BTCUSDT",
+      "interval": "5",
+      "start": 1717074300000,
+      "end": 1717074599999,
+      "open": "50000",
+      "high": "50100",
+      "low": "49950",
+      "close": "50050",
+      "volume": "123.45",
+      "turnover": "6172500",
+      "confirm": true
+    }
+  ]
+}
