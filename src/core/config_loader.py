@@ -32,10 +32,41 @@ class ConfigLoader:
         return cls._instance
 
     def __init__(self, config_path: str | Path = "config/settings.yaml") -> None:
-        # защита от повторной инициализации при множественных вызовах ConfigLoader()
-        if getattr(self, "_initialized", False):
+        """
+        Инициализация singleton-а.
+
+        Ключевой момент: нам нужно совместить две вещи:
+        - singleton-поведение (один загрузчик на процесс);
+        - контракт `create_app(config_path=...)` из документации, где точка входа
+          вправе задать путь к конфигу.
+
+        Поэтому, если экземпляр уже создан, но конфигурация ещё не загружена,
+        а `config_path` отличается от текущего — мы обновляем путь и помечаем
+        конфиг как требующий перезагрузки.
+        """
+        # была ли уже инициализация?
+        existing_initialized = getattr(self, "_initialized", False)
+        existing_path = getattr(self, "_config_path", None) if existing_initialized else None
+
+        if existing_initialized:
+            new_path = Path(config_path)
+            # Если конфиг ещё не был загружен и нам передали новый путь — считаем,
+            # что более поздний вызов (например, из create_app) победил.
+            if (
+                existing_path is not None
+                and new_path != existing_path
+                and getattr(self, "_config", None) is None
+            ):
+                self._config_path = new_path
+                self._needs_reload = True
+                logger.info(
+                    "ConfigLoader config_path overridden before first load",
+                    extra={"old_path": str(existing_path), "new_path": str(new_path)},
+                )
+            # В остальных случаях просто используем уже существующую конфигурацию.
             return
 
+        # Первая инициализация singleton-а
         self._initialized = True
         self._config_path = Path(config_path)
         self._config: Optional[AppConfig] = None
@@ -132,14 +163,19 @@ class ConfigLoader:
             # Не удалось повесить обработчик (например, не main thread) — просто логируем отладочно.
             logger.debug("SIGHUP handler was not installed", exc_info=True)
 
-    def _handle_sighup(self, signum: int, frame: Any) -> None:  # noqa: ARG002
+
+    def _handle_sighup(self, _signum: int, _frame: Any) -> None:
         """
         Обработчик сигнала SIGHUP.
 
         Не выполняет тяжёлых операций: только помечает конфиг как устаревший.
         """
-        logger.info("Received SIGHUP, configuration will be reloaded on next access")
+        logger.info(
+            "Received SIGHUP, configuration will be reloaded on next access",
+            extra={"signum": _signum},
+        )
         self._needs_reload = True
+
 
     def _expand_env_placeholders(self, data: Any) -> Any:
         """
@@ -219,7 +255,7 @@ class ConfigLoader:
             - "dsn"
         будет заменён на "***".
         """
-        sensitive_keywords = ("secret", "password", "token", "api_key", "apikey", "dsn", "key")
+        sensitive_keywords = ["secret", "password", "token", "api_key", "dsn"]
 
         if isinstance(data, dict):
             masked: Dict[str, Any] = {}
