@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import List, Optional, Literal
 from uuid import UUID
 
@@ -61,14 +61,25 @@ async def list_signals(
     """
     Получить список активных сигналов стратегии AVI-5.
 
-    Соответствует описанию `GET /signals` в docs/api.md:
+    Основано на описании `GET /signals` в docs/api.md:
 
     * поддерживает фильтры `symbol`, `direction`, `min_probability`;
-    * параметр `limit` ограничивает число возвращаемых записей;
-    * параметр `since` позволяет запрашивать сигналы не старше заданного момента.
+    * дополнительно поддерживает `limit` и `since` для ограничения объёма истории;
+    * активным считается сигнал без error_code и с queued_until == NULL или в будущем.
     """
     # Базовая выборка из БД (ограничение по времени и символу на уровне SQL).
     signals = await repo.list_recent(limit=limit, symbol=symbol, since=since)
+    now = datetime.now(timezone.utc)
+
+    # Фильтрация только активных сигналов:
+    # - queued_until отсутствует или ещё не наступил;
+    # - error_code не установлен (сигнал не в ошибочном состоянии).
+    signals = [
+        s
+        for s in signals
+        if (s.queued_until is None or s.queued_until >= now)
+        and s.error_code is None
+    ]
 
     # Дополнительная фильтрация по направлению, если указано.
     if direction is not None:
