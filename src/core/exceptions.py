@@ -12,6 +12,7 @@ __all__ = [
     "ExecutionError",
     "ExternalAPIError",
     "WSConnectionError",
+    "RateLimitExceededError",
 ]
 
 
@@ -103,6 +104,19 @@ class WSConnectionError(NetworkError):
 
     Любые проблемы с установлением / поддержанием WS-соединения
     (как с биржей, так и с другими сервисами) должны наследоваться от неё.
+    """
+
+    pass
+
+
+class RateLimitExceededError(AppError):
+    """
+    Базовая ошибка превышения лимитов (REST, WS, webhooks).
+
+    На неё уже навешиваются более конкретные:
+        - RateLimitTimeoutError
+        - WSRateLimitError
+    в модуле rate_limiter.
     """
 
     pass
