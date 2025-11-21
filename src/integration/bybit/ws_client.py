@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import hmac
 import json
 import random
 import time
-import hmac
-import hashlib
 from typing import Any, AsyncGenerator, Dict, Iterable, List, Optional, Union
 
 import aiohttp
@@ -14,7 +14,6 @@ from src.core.exceptions import WSConnectionError
 from src.core.logging_config import get_logger
 from src.integration.bybit.rate_limiter import RateLimiterBybit
 from src.integration.bybit.rest_client import BybitRESTClient
-
 
 logger = get_logger(__name__)
 
@@ -34,7 +33,13 @@ class BybitWSClient:
     Низкоуровневый WebSocket-клиент Bybit.
 
     Экземпляр управляет одним WS-соединением (публичным или приватным),
-    поддерживает подписки, авто-reconnect и gap-detector по sequence.
+    поддерживает:
+
+      * установление/закрытие соединения;
+      * подписки на топики;
+      * чтение сообщений через async-генератор;
+      * авто-reconnect с экспоненциальным backoff;
+      * gap-detector по sequence с fallback на REST snapshot.
     """
 
     def __init__(
@@ -59,16 +64,11 @@ class BybitWSClient:
         :param api_key: API-ключ Bybit (обязателен для приватных каналов).
         :param api_secret: Секретный ключ Bybit (обязателен для приватных каналов).
         :param recv_window_ms: recv_window для подписи приватных сообщений.
-        :param connect_timeout: Таймаут установления соединения (секунды).
-        :param max_reconnect_attempts: Максимальное число попыток reconnect подряд.
-        :param session: Внешний aiohttp.ClientSession (если None — создаётся внутри).
+        :param connect_timeout: Таймаут установления WS-соединения.
+        :param max_reconnect_attempts: Максимум попыток reconnect'а перед ошибкой.
+        :param session: Опциональный aiohttp.ClientSession (если не передан,
+                        клиент создаёт свой и управляет его жизненным циклом).
         """
-        if not ws_url:
-            raise ValueError("ws_url must be a non-empty string")
-
-        if is_private and (not api_key or not api_secret):
-            raise ValueError("api_key and api_secret are required for private WS connections")
-
         self._ws_url = ws_url
         self._rate_limiter = rate_limiter
         self._rest_client = rest_client
@@ -91,7 +91,7 @@ class BybitWSClient:
     @property
     def is_connected(self) -> bool:
         """Возвращает True, если WebSocket-соединение активно."""
-        return self._ws is not None and not self._ws.closed  # type: ignore[no-any-return]
+        return self._ws is not None and not self._ws.closed
 
     async def connect(self) -> None:
         """
@@ -107,7 +107,11 @@ class BybitWSClient:
             self._session = aiohttp.ClientSession()
 
         try:
-            logger.info("Connecting to Bybit WebSocket", ws_url=self._ws_url, is_private=self._is_private)
+            logger.info(
+                "Connecting to Bybit WebSocket",
+                ws_url=self._ws_url,
+                is_private=self._is_private,
+            )
             self._ws = await asyncio.wait_for(
                 self._session.ws_connect(self._ws_url, heartbeat=30),
                 timeout=self._connect_timeout,
@@ -119,7 +123,11 @@ class BybitWSClient:
                 details={"ws_url": self._ws_url, "timeout": self._connect_timeout},
             ) from exc
         except aiohttp.ClientError as exc:
-            logger.error("Failed to establish WebSocket connection", ws_url=self._ws_url, exc_info=True)
+            logger.error(
+                "Failed to establish WebSocket connection",
+                ws_url=self._ws_url,
+                exc_info=True,
+            )
             raise WSConnectionError(
                 "Failed to establish WebSocket connection to Bybit",
                 details={"ws_url": self._ws_url},
@@ -129,14 +137,18 @@ class BybitWSClient:
         if self._is_private:
             await self._authenticate()
 
-        logger.info("Bybit WebSocket connected", ws_url=self._ws_url, is_private=self._is_private)
+        logger.info(
+            "Bybit WebSocket connected",
+            ws_url=self._ws_url,
+            is_private=self._is_private,
+        )
 
     async def _authenticate(self) -> None:
         """
         Выполнить аутентификацию на приватном WS-канале.
 
         Алгоритм подписи приближен к REST v5:
-        sign = HMAC_SHA256(secret, timestamp + api_key + recv_window)
+            sign = HMAC_SHA256(secret, timestamp + api_key + recv_window)
         """
         assert self._ws is not None
         assert self._api_key is not None and self._api_secret is not None
@@ -162,7 +174,7 @@ class BybitWSClient:
         if resp_msg.type != aiohttp.WSMsgType.TEXT:
             raise WSConnectionError(
                 "Unexpected auth response type from Bybit WS",
-                details={"ws_url": self._ws_url, "msg_type": str(resp_msg.type)},
+                details={"type": str(resp_msg.type)},
             )
 
         try:
@@ -201,7 +213,8 @@ class BybitWSClient:
         if not topic_list:
             return
 
-        if self._ws is None:
+        # На всякий случай проверим, что соединение реально живо.
+        if self._ws is None or self._ws.closed:
             raise WSConnectionError(
                 "WebSocket is not connected",
                 details={"ws_url": self._ws_url},
@@ -259,7 +272,7 @@ class BybitWSClient:
             except asyncio.CancelledError:
                 # Позволяем корректно отменять вызывающей стороне.
                 raise
-            except Exception as exc:  # noqa: BLE001
+            except Exception:
                 logger.warning(
                     "Error while receiving WS message; will attempt reconnect",
                     ws_url=self._ws_url,
@@ -275,7 +288,7 @@ class BybitWSClient:
                     logger.warning("Received non-JSON WS message", raw=msg.data)
                     continue
 
-                # Игнорируем служебные ping/pong и ответы на subscribe.
+                # Игнорируем служебные ping/pong и ответы на subscribe/auth.
                 if self._is_control_message(payload):
                     continue
 
@@ -288,7 +301,11 @@ class BybitWSClient:
                 yield channel, data, sequence
 
             elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
-                logger.warning("Bybit WS connection closed", ws_url=self._ws_url, msg_type=str(msg.type))
+                logger.warning(
+                    "Bybit WS connection closed",
+                    ws_url=self._ws_url,
+                    msg_type=str(msg.type),
+                )
                 raise WSConnectionClosed(
                     "Bybit WebSocket connection closed",
                     details={"ws_url": self._ws_url, "msg_type": str(msg.type)},
@@ -297,7 +314,7 @@ class BybitWSClient:
                 if self._ws is not None:
                     await self._ws.pong()
             elif msg.type == aiohttp.WSMsgType.PONG:
-                # ничего делать не нужно
+                # Ничего делать не нужно.
                 continue
             else:
                 # Binary, close и прочие типы нам не интересны.
@@ -357,7 +374,7 @@ class BybitWSClient:
     def _is_control_message(self, payload: Dict[str, Any]) -> bool:
         """
         Определить, является ли сообщение служебным:
-        ping/pong, подтверждения подписок и т.п.
+        ping/pong, подтверждения подписок, auth и т.п.
         """
         # Bybit обычно шлёт поле "op" для служебных сообщений.
         op = payload.get("op")
@@ -392,7 +409,7 @@ class BybitWSClient:
         try:
             sequence = int(raw_seq)
         except (TypeError, ValueError):
-            raise KeyError("WS payload sequence field is not an integer")  # type: ignore[no-any-return]
+            raise KeyError("WS payload sequence field is not an integer")
 
         data_field = payload.get("data")
         if data_field is None:
@@ -417,7 +434,7 @@ class BybitWSClient:
 
         self._last_sequence[channel] = sequence
 
-        # Сделаем sequence частью payload, чтобы downstream-код мог им пользоваться.
+        # Сделаем sequence и channel частью payload, чтобы downstream-код мог им пользоваться.
         data.setdefault("sequence", sequence)
         data.setdefault("channel", channel)
 
@@ -441,10 +458,12 @@ class BybitWSClient:
 
         if kind == "kline":
             if len(parts) < 3:
-                raise ValueError("Invalid kline channel format, expected 'kline.<interval>.<symbol>'")
+                raise ValueError(
+                    "Invalid kline channel format, expected 'kline.<interval>.<symbol>'",
+                )
             interval = parts[1]
             symbol = parts[2]
-            params = {
+            params: Dict[str, Any] = {
                 "category": "linear",
                 "symbol": symbol,
                 "interval": interval,
@@ -453,7 +472,9 @@ class BybitWSClient:
             path = "v5/market/kline"
         elif kind == "orderbook":
             if len(parts) < 3:
-                raise ValueError("Invalid orderbook channel format, expected 'orderbook.<depth>.<symbol>'")
+                raise ValueError(
+                    "Invalid orderbook channel format, expected 'orderbook.<depth>.<symbol>'",
+                )
             depth = parts[1]
             symbol = parts[2]
             params = {
@@ -481,3 +502,18 @@ class BybitWSClient:
         )
 
         return dict(snapshot)
+
+    async def close(self) -> None:
+        """
+        Корректно закрыть WebSocket и HTTP-сессию (если клиент ей владеет).
+
+        Используется при штатном останове приложения, чтобы не оставлять
+        незакрытых соединений.
+        """
+        if self._ws is not None and not self._ws.closed:
+            await self._ws.close()
+        self._ws = None
+
+        if self._owns_session and self._session is not None and not self._session.closed:
+            await self._session.close()
+        self._session = None
