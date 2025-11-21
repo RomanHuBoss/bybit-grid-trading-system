@@ -8,7 +8,6 @@ from typing import Dict, Type
 
 from src.core.exceptions import RateLimitExceededError
 
-
 __all__ = [
     "RateLimitTimeoutError",
     "WSRateLimitError",
@@ -194,9 +193,11 @@ class RateLimiterBybit:
             now = time.monotonic()
             remaining = deadline - now
             if remaining <= 0:
+                # передаём details позиционным вторым аргументом,
+                # чтобы IDE не ругалась на "Unexpected argument"
                 raise error_cls(
                     "Rate limit exceeded while waiting for tokens",
-                    details={
+                    {
                         "bucket": bucket_name,
                         "requested_tokens": tokens,
                         "timeout_sec": timeout,
