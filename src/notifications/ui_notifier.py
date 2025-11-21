@@ -1,158 +1,206 @@
+# src/notifications/ui_notifier.py
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, is_dataclass
+from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional
+from enum import Enum
+from typing import Any, Mapping, Optional
 from uuid import uuid4
 
-from src.core.models import Signal
+from redis.asyncio import Redis
+
+from src.core.logging_config import get_logger
+from src.core.models import Position, Signal
+
+__all__ = ["UIEventType", "UIEnvelope", "UINotifier"]
+
+logger = get_logger("notifications.ui_notifier")
+
+# Канал pub/sub, который слушает SSE-эндпоинт /stream.
+DEFAULT_UI_CHANNEL = "signals"
 
 
-try:
-    # Предпочтительно использовать redis.asyncio.Redis, если библиотека доступна.
-    from redis.asyncio import Redis  # type: ignore[import]
-except Exception:  # pragma: no cover - тип важен только для подсказок
-    Redis = Any  # type: ignore[assignment]
+class UIEventType(str, Enum):
+    """
+    Типы событий, которые транслируются во фронтенд через SSE.
+    """
+
+    SIGNAL = "signal"
+    POSITION = "position"
+    METRICS = "metrics"
+    KILL_SWITCH = "kill_switch"
+    GENERIC = "generic"
+
+
+@dataclass(frozen=True)
+class UIEnvelope:
+    """
+    Универсальный формат сообщения, которое уходит в Redis pub/sub.
+    """
+
+    id: str
+    event: str
+    timestamp: str
+    data: Mapping[str, Any]
+
+    def to_json(self) -> str:
+        payload = {
+            "id": self.id,
+            "event": self.event,
+            "timestamp": self.timestamp,
+            "data": self.data,
+        }
+        return json.dumps(payload, default=str)
 
 
 class UINotifier:
     """
-    Асинхронный паблишер событий для UI.
+    Нотификатор для фронтенда AVI-5 через Redis pub/sub.
 
-    Отвечает за публикацию доменных событий (сигналы, BE-события, метрики,
-    состояние kill-switch) в Redis pub/sub-канал, откуда их забирает
-    SSE-слой и стримит в браузер.
-
-    Формат сообщения в канале (JSON):
-
-    {
-        "id": "<uuid>",              # используется SSE-слоем как Last-Event-ID
-        "event": "<тип_события>",    # "signal" / "be.<...>" / "metrics" / "kill_switch"
-        "timestamp": "<iso8601>",    # UTC-время генерации события
-        "data": {...}                # доменные данные
-    }
+    - формирует envelope (id + event + timestamp + payload);
+    - публикует его в Redis-канал, который слушает SSE /stream;
+    - даёт high-level методы для сигналов, позиций, метрик и kill-switch.
     """
 
-    def __init__(self, redis: Redis, channel: str = "signals") -> None:
-        """
-        :param redis: Экземпляр Redis-клиента (redis.asyncio.Redis или совместимый).
-        :param channel: Имя pub/sub-канала для realtime-событий UI.
-                        Обычно соответствует ui.sse_channel из конфигурации.
-        """
-        if not channel:
-            raise ValueError("channel must be non-empty")
+    def __init__(
+        self,
+        redis: Redis,
+        *,
+        channel: str = DEFAULT_UI_CHANNEL,
+    ) -> None:
+        self._redis = redis
+        self._channel = channel
 
-        self._redis: Redis = redis
-        self._channel: str = channel
-
-    # --------------------------------------------------------------------- #
-    # Публичный API публикации событий
-    # --------------------------------------------------------------------- #
-
-    async def publish_signal(self, signal: Signal) -> None:
-        """
-        Публикует событие о новом торговом сигнале.
-
-        :param signal: Доменная модель сигнала, сформированная AVI-5.
-        """
-        payload = self._to_payload(signal)
-        await self._publish("signal", payload)
-
-    async def publish_be_event(self, event_type: str, payload: Dict[str, Any]) -> None:
-        """
-        Публикует backend-событие для UI.
-
-        :param event_type: Логический тип события (например, "order_placed", "order_filled").
-                           Используется как суффикс в имени события: "be.<event_type>".
-        :param payload: Произвольные данные события, сериализуемые в JSON.
-        """
-        if not event_type:
-            raise ValueError("event_type must be non-empty")
-
-        event_name = f"be.{event_type}"
-        await self._publish(event_name, dict(payload))
-
-    async def publish_metrics(self, metrics: Dict[str, Any]) -> None:
-        """
-        Публикует агрегированные метрики стратегии/инфраструктуры.
-
-        :param metrics: Словарь с метриками (например, win_rate, profit_factor и т.п.).
-        """
-        await self._publish("metrics", dict(metrics))
-
-    async def publish_kill_switch(self, active: bool, reason: Optional[str] = None) -> None:
-        """
-        Публикует изменение состояния kill-switch.
-
-        :param active: Новый статус kill-switch (True — включен, новые позиции не открываем).
-        :param reason: Текстовое пояснение причины изменения статуса (опционально).
-        """
-        data: Dict[str, Any] = {
-            "active": active,
-            "reason": reason,
-        }
-        await self._publish("kill_switch", data)
-
-    # --------------------------------------------------------------------- #
-    # Внутренние помощники
-    # --------------------------------------------------------------------- #
-
-    async def _publish(self, event: str, data: Dict[str, Any]) -> None:
-        """
-        Сериализует и публикует событие в Redis-канал.
-        """
-        message = self._serialize_event(event, data)
-        # publish возвращает количество подписчиков; для UI-нотификатора
-        # это не критично, поэтому результат можно игнорировать.
-        await self._redis.publish(self._channel, message)
+    # --- helpers ------------------------------------------------------------
 
     @staticmethod
-    def _to_payload(obj: Any) -> Dict[str, Any]:
-        """
-        Приводит произвольный объект к словарю для вставки в поле `data`.
+    def _now_iso() -> str:
+        return datetime.now(timezone.utc).isoformat()
 
-        Поддерживаются:
-        - pydantic-модели (BaseModel);
-        - dataclass-объекты;
-        - уже готовые dict'ы;
-        - всё остальное — через vars()/asdict()-подобную семантику.
-        """
-        # Pydantic BaseModel
-        if hasattr(obj, "dict") and callable(getattr(obj, "dict")):
-            return obj.dict()  # type: ignore[return-value]
+    def _build_envelope(
+        self,
+        *,
+        event_type: UIEventType,
+        data: Mapping[str, Any],
+        id_: Optional[str] = None,
+    ) -> UIEnvelope:
+        if id_ is None:
+            id_ = str(uuid4())
 
-        # dataclasses
-        if is_dataclass(obj):
-            return asdict(obj)
+        return UIEnvelope(
+            id=id_,
+            event=event_type.value,
+            timestamp=self._now_iso(),
+            data=data,
+        )
 
-        # dict как есть
-        if isinstance(obj, dict):
-            return obj
+    async def _publish_envelope(self, envelope: UIEnvelope) -> None:
+        payload = envelope.to_json()
 
-        # Fallback — пытаемся интерпретировать как объект с __dict__
-        if hasattr(obj, "__dict__"):
-            return dict(vars(obj))
-
-        # Совсем простой случай — оборачиваем как значение
-        return {"value": obj}
+        try:
+            await self._redis.publish(self._channel, payload)
+            logger.debug(
+                "UI envelope published",
+                extra={
+                    "channel": self._channel,
+                    "event": envelope.event,
+                    "id": envelope.id,
+                },
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.error(
+                "Failed to publish UI envelope to Redis",
+                extra={
+                    "channel": self._channel,
+                    "event": envelope.event,
+                    "id": envelope.id,
+                    "error": str(exc),
+                },
+            )
 
     @staticmethod
-    def _serialize_event(event: str, data: Dict[str, Any]) -> str:
+    def _model_to_dict(model: Any) -> Mapping[str, Any]:
         """
-        Собирает финальный JSON, который будет опубликован в Redis.
+        Аккуратно превратить pydantic-модель (v1/v2) или произвольный объект
+        в dict **без** использования .dict(), чтобы не ловить deprecation warning.
+        """
+        # pydantic v2
+        if hasattr(model, "model_dump"):
+            return model.model_dump()  # type: ignore[no-any-return]
 
-        :param event: Имя события (signal / be.* / metrics / kill_switch).
-        :param data: Доменные данные события.
-        :return: JSON-строка.
+        # pydantic v1 (на всякий случай, если где-то ещё такая зависимость)
+        model_dict = getattr(model, "__dict__", None)
+        if isinstance(model_dict, dict):
+            # выкидываем приватные/служебные поля, чтобы не светить лишнее
+            return {k: v for k, v in model_dict.items() if not k.startswith("_")}
+
+        # Фолбэк совсем на чёрный день
+        return {}
+
+    # --- public API ---------------------------------------------------------
+
+    async def notify_raw(
+        self,
+        event_type: UIEventType,
+        data: Mapping[str, Any],
+        id_: Optional[str] = None,
+    ) -> None:
+        envelope = self._build_envelope(event_type=event_type, data=data, id_=id_)
+        await self._publish_envelope(envelope)
+
+    async def notify_signal(self, signal: Signal) -> None:
         """
-        event_id = uuid4().hex
-        envelope = {
-            "id": event_id,
-            "event": event,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "data": data,
-        }
-        # default=str позволяет сериализовать Decimal, datetime и прочие типы,
-        # которые pydantic мог оставить как есть.
-        return json.dumps(envelope, default=str)
+        Отправить во фронт событие о новом/обновлённом Signal.
+        """
+        try:
+            payload = self._model_to_dict(signal)
+        except Exception as exc:  # noqa: BLE001
+            logger.error(
+                "Failed to serialize Signal for UI notification",
+                extra={"signal_id": str(getattr(signal, "id", "?")), "error": str(exc)},
+            )
+            return
+
+        envelope = self._build_envelope(event_type=UIEventType.SIGNAL, data=payload)
+        await self._publish_envelope(envelope)
+
+    async def notify_position(self, position: Position) -> None:
+        """
+        Отправить во фронт событие об изменении позиции.
+        """
+        try:
+            payload = self._model_to_dict(position)
+        except Exception as exc:  # noqa: BLE001
+            logger.error(
+                "Failed to serialize Position for UI notification",
+                extra={"position_id": str(getattr(position, "id", "?")), "error": str(exc)},
+            )
+            return
+
+        envelope = self._build_envelope(event_type=UIEventType.POSITION, data=payload)
+        await self._publish_envelope(envelope)
+
+    async def notify_metrics(self, metrics: Mapping[str, Any]) -> None:
+        """
+        Отправить агрегированные метрики стратегии во фронт.
+        """
+        envelope = self._build_envelope(event_type=UIEventType.METRICS, data=metrics)
+        await self._publish_envelope(envelope)
+
+    async def notify_kill_switch(self, payload: Mapping[str, Any]) -> None:
+        """
+        Отправить во фронт событие о срабатывании kill-switch.
+        """
+        envelope = self._build_envelope(
+            event_type=UIEventType.KILL_SWITCH,
+            data=payload,
+        )
+        await self._publish_envelope(envelope)
+
+    async def notify_generic(self, data: Mapping[str, Any]) -> None:
+        """
+        Универсальное generic-событие для новых типов, пока без отдельного event_type.
+        """
+        envelope = self._build_envelope(event_type=UIEventType.GENERIC, data=data)
+        await self._publish_envelope(envelope)
