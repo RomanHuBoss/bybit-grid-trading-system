@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import List, Optional
+from typing import List, Optional, Literal
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -32,28 +32,54 @@ def get_signal_repository() -> SignalRepository:
 
 @router.get("/", response_model=List[Signal])
 async def list_signals(
+    symbol: Optional[str] = Query(
+        default=None,
+        description="Опциональный фильтр по тикеру, например BTCUSDT.",
+    ),
+    direction: Optional[Literal["long", "short"]] = Query(
+        default=None,
+        description="Фильтр по направлению сигнала: long или short.",
+    ),
+    min_probability: Optional[float] = Query(
+        default=None,
+        ge=0.0,
+        le=1.0,
+        description="Минимальная вероятность (p_win) в диапазоне [0, 1].",
+    ),
     limit: int = Query(
-        100,
+        default=100,
         ge=1,
         le=1000,
         description="Максимальное количество последних сигналов.",
     ),
-    symbol: Optional[str] = Query(
-        None,
-        description="Опциональный фильтр по символу.",
-    ),
     since: Optional[datetime] = Query(
-        None,
-        description="Опциональный фильтр по created_at >= since (UTC).",
+        default=None,
+        description="Необязательный фильтр по created_at >= since (UTC).",
     ),
     repo: SignalRepository = Depends(get_signal_repository),
 ) -> List[Signal]:
     """
-    Получить список последних сигналов AVI-5.
+    Получить список активных сигналов стратегии AVI-5.
 
-    Используется UI/аналитикой для просмотра того, что сейчас генерирует стратегия.
+    Соответствует описанию `GET /signals` в docs/api.md:
+
+    * поддерживает фильтры `symbol`, `direction`, `min_probability`;
+    * параметр `limit` ограничивает число возвращаемых записей;
+    * параметр `since` позволяет запрашивать сигналы не старше заданного момента.
     """
+    # Базовая выборка из БД (ограничение по времени и символу на уровне SQL).
     signals = await repo.list_recent(limit=limit, symbol=symbol, since=since)
+
+    # Дополнительная фильтрация по направлению, если указано.
+    if direction is not None:
+        signals = [s for s in signals if s.direction == direction]
+
+    # Фильтрация по минимальной вероятности p_win.
+    if min_probability is not None:
+        # probability у Signal — Decimal; сравнение через float
+        # для диапазона [0, 1] достаточно точно.
+        signals = [s for s in signals if float(s.probability) >= min_probability]
+
     return signals
 
 
