@@ -1,137 +1,241 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional, Tuple
 
 from redis.asyncio import Redis
 
-from src.core.constants import CHURN_BLOCK_SEC
+from src.core.logging_config import get_logger
+
+__all__ = ["AntiChurnGuard"]
+
+logger = get_logger("risk.anti_churn")
 
 
 class AntiChurnGuard:
     """
-    Anti-churn guard: блокировка повторного однонаправленного входа
-    по символу на фиксированное время (CHURN_BLOCK_SEC, по умолчанию 15 минут).
+    Простейший anti-churn guard поверх Redis.
 
-    Логика:
-    - при каждом подтверждённом входе вызывается record_signal(...) — пишет last_signal_time в Redis с TTL;
-    - при появлении нового сигнала вызывается is_blocked(...):
-        * если с момента last_signal_time прошло меньше CHURN_BLOCK_SEC, сигнал считается "зачёрненным";
-        * вызывающий код может перевести такой сигнал в статус 'queued' и выставить queued_until;
-    - clear_block(...) опционально используется при закрытии позиции,
-      чтобы позволить немедленный повторный вход (например, при ручном управлении).
+    Назначение:
+        - после входа по символу/направлению (symbol + direction)
+          блокировать повторные входы на заданное окно времени;
+        - при запросе нового сигнала отвечать, можно ли входить.
+
+    Формат ключа:
+        anti_churn:{SYMBOL_UPPER}:{DIRECTION_LOWER}
+
+    Значение:
+        ISO-строка времени истечения блокировки (UTC).
+
+    TTL:
+        - задаётся целым числом секунд;
+        - может приходить извне (из конфига / RiskLimits) — но здесь есть
+          дефолт и чтение из окружения (ANTI_CHURN_TTL_SECONDS), чтобы
+          утилиты и тесты могли его переопределять.
     """
 
-    _KEY_TEMPLATE = "last_signal_time:{symbol}:{side}"
+    # Дефолтное окно блокировки, секунд.
+    # Нормальное значение задаётся конфигом, но этот дефолт безопасен и
+    # используется только как запасной вариант.
+    DEFAULT_TTL_SECONDS: int = 300
 
     @staticmethod
-    def _make_key(symbol: str, side: str) -> str:
+    def _normalize_symbol(symbol: str) -> str:
         """
-        Собрать ключ Redis для хранения таймстемпа последнего сигнала.
+        Нормализовать символ к верхнему регистру.
 
-        Symbol и side нормализуем к верхнему/нижнему регистру для предсказуемости.
+        Anti-churn должен быть инвариантен к регистру.
         """
-        return AntiChurnGuard._KEY_TEMPLATE.format(
-            symbol=symbol.upper(),
-            side=side.lower(),
-        )
+        return symbol.upper()
 
     @staticmethod
+    def _normalize_direction(direction: str) -> str:
+        """
+        Нормализовать направление к нижнему регистру.
+
+        Ожидаемые значения: "long" / "short".
+        """
+        return direction.lower()
+
+    @classmethod
+    def _make_key(cls, symbol: str, direction: str) -> str:
+        """
+        Сформировать ключ Redis для пары (symbol, direction).
+        """
+        symbol_norm = cls._normalize_symbol(symbol)
+        direction_norm = cls._normalize_direction(direction)
+        return f"anti_churn:{symbol_norm}:{direction_norm}"
+
+    @classmethod
+    def _resolve_ttl_seconds(cls, ttl_seconds: Optional[int]) -> int:
+        """
+        Определить TTL блокировки.
+
+        Приоритет:
+            1) Явно переданное значение ttl_seconds (если > 0);
+            2) Переменная окружения ANTI_CHURN_TTL_SECONDS (если > 0);
+            3) DEFAULT_TTL_SECONDS.
+        """
+        if ttl_seconds is not None and ttl_seconds > 0:
+            return ttl_seconds
+
+        from os import getenv
+
+        env_value = getenv("ANTI_CHURN_TTL_SECONDS")
+        if env_value:
+            try:
+                value = int(env_value)
+                if value > 0:
+                    return value
+            except ValueError:
+                logger.warning(
+                    "Invalid ANTI_CHURN_TTL_SECONDS value in environment",
+                    raw_value=env_value,
+                )
+
+        return cls.DEFAULT_TTL_SECONDS
+
+    # --------------------------------------------------------------------- #
+    # Публичный async API                                                   #
+    # --------------------------------------------------------------------- #
+
+    @classmethod
     async def is_blocked(
+        cls,
         redis: Redis,
         symbol: str,
-        side: str,
+        direction: str,
+        *,
         now: Optional[datetime] = None,
     ) -> Tuple[bool, Optional[datetime]]:
         """
-        Проверить, находится ли символ/направление в состоянии anti-churn блока.
+        Проверить, заблокирован ли вход по символу/направлению.
 
-        :param redis: Экземпляр Redis (redis.asyncio.Redis).
-        :param symbol: Торговый символ (например, "BTCUSDT").
-        :param side: Направление сигнала: "long" или "short".
-        :param now: Текущий момент времени; если не указан — используется UTC now.
-        :return: Кортеж (blocked, block_until):
-                 - blocked == True, если с момента последнего сигнала прошло
-                   меньше CHURN_BLOCK_SEC секунд;
-                 - block_until — момент, когда блок истечёт, либо None, если блок не активен.
+        :param redis: Async Redis client.
+        :param symbol: Символ инструмента.
+        :param direction: Направление ("long" / "short").
+        :param now: Текущее время (UTC). Если None — будет взято `datetime.now(timezone.utc)`.
 
-        Исключения:
-        - Любые ошибки Redis пробрасываются наверх (RedisError и др.).
+        :return: (is_blocked, block_until). Если не заблокировано — (False, None).
+
+        При сбоях Redis поведение — fail-closed: считаем, что вход заблокирован,
+        чтобы не ослаблять защиту по рискам.
         """
         if now is None:
             now = datetime.now(timezone.utc)
 
-        key = AntiChurnGuard._make_key(symbol, side)
-        raw_ts = await redis.get(key)
-        if raw_ts is None:
-            # Нет записанного сигнала — блок не активен.
+        key = cls._make_key(symbol, direction)
+
+        try:
+            value = await redis.get(key)
+        except Exception as exc:  # noqa: BLE001
+            logger.error(
+                "Failed to read anti-churn key from Redis; failing closed",
+                error=str(exc),
+                symbol=symbol,
+                direction=direction,
+                redis_error=repr(exc),
+            )
+            # fail-closed: при проблемах Redis блокируем вход
+            return True, None
+
+        if value is None:
+            # Блокировки нет.
             return False, None
 
         try:
-            last_ts = float(raw_ts)
-        except (TypeError, ValueError):
-            # Если в ключе неожиданно мусор — защитно считаем, что блок не активен,
-            # а вызывающий код может переписать ключ через record_signal.
+            # В Redis храним ISO-строку UTC.
+            block_until = datetime.fromisoformat(value.decode("utf-8"))
+            if block_until.tzinfo is None:
+                block_until = block_until.replace(tzinfo=timezone.utc)
+        except Exception:  # noqa: BLE001
+            # Нечитаемое значение — лучше удалить ключ и считать, что блокировки нет.
+            logger.warning(
+                "Invalid anti-churn value in Redis, deleting key",
+                key=key,
+                raw_value=value,
+            )
+            try:
+                await redis.delete(key)
+            except Exception:
+                logger.exception("Failed to delete invalid anti-churn key", key=key)
             return False, None
 
-        last_time = datetime.fromtimestamp(last_ts, tz=timezone.utc)
-        elapsed_sec = (now - last_time).total_seconds()
-
-        if elapsed_sec >= CHURN_BLOCK_SEC:
-            # Время блока уже прошло — можно считать, что блок не активен.
+        # Если окно уже истекло — удаляем ключ и разрешаем вход.
+        if block_until <= now:
+            try:
+                await redis.delete(key)
+            except Exception:  # noqa: BLE001
+                logger.exception("Failed to delete expired anti-churn key", key=key)
             return False, None
 
-        block_until = last_time + timedelta(seconds=CHURN_BLOCK_SEC)
+        # Блокировка активна.
         return True, block_until
 
-    @staticmethod
+    @classmethod
     async def record_signal(
+        cls,
         redis: Redis,
+        *,
         symbol: str,
         side: str,
         now: Optional[datetime] = None,
+        ttl_seconds: Optional[int] = None,
     ) -> None:
         """
-        Зафиксировать факт нового сигнала по символу/направлению.
+        Зафиксировать факт входа по символу/направлению.
 
-        Записывает текущий таймстемп в Redis с TTL = CHURN_BLOCK_SEC.
-        Используется при подтверждении сигнала, который прошёл все остальные проверки.
+        Устанавливает Redis-ключ с TTL. Значение — время истечения окна блокировки.
 
-        :param redis: Экземпляр Redis.
-        :param symbol: Торговый символ (например, "BTCUSDT").
-        :param side: Направление сигнала: "long" или "short".
-        :param now: Момент времени сигнала; если не указан — используется UTC now.
-
-        Исключения:
-        - Любые ошибки Redis пробрасываются наверх.
+        :param redis: Async Redis client.
+        :param symbol: Символ инструмента (например, "BTCUSDT").
+        :param side: Направление (long/short).
+        :param now: Текущее время (UTC). Если None — будет взято системное.
+        :param ttl_seconds: Явный TTL окна блокировки, если нужно переопределить
+                            дефолт/конфиг (например, в тестах).
         """
         if now is None:
             now = datetime.now(timezone.utc)
 
-        key = AntiChurnGuard._make_key(symbol, side)
-        ts = now.timestamp()
+        ttl = cls._resolve_ttl_seconds(ttl_seconds)
+        block_until = now + timedelta(seconds=ttl)
+        key = cls._make_key(symbol, side)
 
-        # setex(key, ttl, value) — атомарная установка значения с TTL.
-        await redis.setex(key, CHURN_BLOCK_SEC, str(ts))
+        value = block_until.isoformat()
 
-    @staticmethod
+        try:
+            # setex: установить значение и TTL атомарно
+            await redis.setex(key, ttl, value)
+        except Exception as exc:  # noqa: BLE001
+            # Ошибка Redis не должна ронять основной процесс, но мы её логируем.
+            logger.error(
+                "Failed to record anti-churn entry in Redis",
+                error=str(exc),
+                symbol=symbol,
+                direction=side,
+                ttl_seconds=ttl,
+            )
+
+    @classmethod
     async def clear_block(
+        cls,
         redis: Redis,
         symbol: str,
-        side: str,
+        direction: str,
     ) -> None:
         """
-        Очистить anti-churn блок по символу/направлению.
+        Снять блокировку по символу/направлению.
 
-        Используется, например, при ручном вмешательстве оператора или
-        специальных сценариях, когда повторный вход нужно разрешить немедленно.
-
-        :param redis: Экземпляр Redis.
-        :param symbol: Торговый символ.
-        :param side: Направление ("long"/"short").
+        Используется в административных сценариях и для ручного вмешательства
+        (например, если позицию принудительно закрыли и хотим убрать cooldown).
         """
-        key = AntiChurnGuard._make_key(symbol, side)
-        await redis.delete(key)
-
-
-__all__ = ["AntiChurnGuard"]
+        key = cls._make_key(symbol, direction)
+        try:
+            await redis.delete(key)
+        except Exception as exc:  # noqa: BLE001
+            logger.error(
+                "Failed to clear anti-churn block",
+                error=str(exc),
+                symbol=symbol,
+                direction=direction,
+            )
