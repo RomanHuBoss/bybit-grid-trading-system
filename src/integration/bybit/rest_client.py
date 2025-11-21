@@ -74,7 +74,10 @@ class BybitRESTClient:
         method:
             HTTP-метод ('GET', 'POST' и т.д.).
         path:
-            Относительный путь без ведущего '/', например 'v5/market/tickers'.
+            Относительный путь эндпоинта, с ведущим слэшем или без.
+            Допустимы оба варианта:
+                "/v5/market/tickers" или "v5/market/tickers".
+            Клиент сам нормализует путь.
         params:
             Query-параметры.
         body:
@@ -89,10 +92,13 @@ class BybitRESTClient:
             Локальное переопределение количества ретраев. Если None — берётся
             значение из конфигурации клиента.
         """
-        if not path or path.startswith("/"):
-            raise ValueError("path must be relative without leading '/'")
+        if not path:
+            raise ValueError("path must be non-empty")
 
-        url = self._base_url + path
+        # Допускаем как "/v5/..." так и "v5/...": нормализуем к виду без ведущего слэша.
+        normalized_path = path.lstrip("/")
+
+        url = self._base_url + normalized_path
         retries = self._max_retries if max_retries is None else max_retries
 
         attempt = 0
@@ -119,7 +125,7 @@ class BybitRESTClient:
                     self._apply_auth_headers(
                         headers=headers,
                         method=method.upper(),
-                        path=path,
+                        path=normalized_path,
                         params=params or {},
                         body=body,
                         timestamp_ms=timestamp_ms,
@@ -241,4 +247,4 @@ class BybitRESTClient:
         if not params:
             return ""
         items = sorted(params.items(), key=lambda kv: kv[0])
-        return "&".join(f"{k}={v}" for k, v in items)
+        return "&".join(f"{k}={str(v)}" for k, v in items)
