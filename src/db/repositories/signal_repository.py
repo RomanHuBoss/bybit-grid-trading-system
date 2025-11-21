@@ -17,13 +17,24 @@ __all__ = ["SignalRepository"]
 
 class SignalRepository:
     """
-    Репозиторий для работы с таблицей сигналов в БД.
+    Репозиторий для работы с таблицей `signals`.
 
     Отвечает за:
     - сохранение новых сигналов, публикуемых AVI-5;
     - выборку сигналов по ID;
     - выборку последних сигналов (для UI/аналитики);
     - обновление полей error_code / error_message после обработки сигнала.
+
+    Важно: схема БД и доменная модель `Signal` расходятся по именам части полей,
+    поэтому здесь выполняется явное отображение:
+
+        DB column         -> Signal field
+        ---------------------------------
+        side              -> direction
+        tp1_price         -> tp1
+        tp2_price         -> tp2
+        tp3_price         -> tp3
+        sl_price          -> stop_loss
     """
 
     def __init__(self) -> None:
@@ -50,10 +61,23 @@ class SignalRepository:
         """
         Преобразовать запись asyncpg в доменную модель Signal.
 
-        Предполагается, что имена колонок в таблице `signals`
-        совпадают с полями модели Signal.
+        Так как имена некоторых колонок в таблице `signals` отличаются
+        от имён полей модели `Signal`, выполняем явное отображение.
         """
         data = dict(record)
+
+        field_mapping = {
+            "side": "direction",
+            "tp1_price": "tp1",
+            "tp2_price": "tp2",
+            "tp3_price": "tp3",
+            "sl_price": "stop_loss",
+        }
+
+        for db_field, model_field in field_mapping.items():
+            if db_field in data:
+                data[model_field] = data.pop(db_field)
+
         try:
             return Signal(**data)
         except ValidationError as exc:
@@ -76,22 +100,24 @@ class SignalRepository:
         """
         pool = self._get_pool()
 
+        # См. docs/database_schema.md, раздел "Таблица `signals`":
+        # direction -> side, tp*_price, sl_price.
         query = """
             INSERT INTO signals (
                 id,
                 created_at,
                 symbol,
-                direction,
+                side,
                 entry_price,
                 stake_usd,
                 probability,
                 strategy,
                 strategy_version,
                 queued_until,
-                tp1,
-                tp2,
-                tp3,
-                stop_loss,
+                tp1_price,
+                tp2_price,
+                tp3_price,
+                sl_price,
                 error_code,
                 error_message
             )
@@ -116,7 +142,7 @@ class SignalRepository:
                     signal.id,
                     signal.created_at,
                     signal.symbol,
-                    signal.direction,
+                    signal.direction,   # side
                     signal.entry_price,
                     signal.stake_usd,
                     signal.probability,
@@ -126,7 +152,7 @@ class SignalRepository:
                     signal.tp1,
                     signal.tp2,
                     signal.tp3,
-                    signal.stop_loss,
+                    signal.stop_loss,   # sl_price
                     signal.error_code,
                     signal.error_message,
                 )
@@ -171,7 +197,10 @@ class SignalRepository:
             async with pool.acquire() as conn:
                 record = await conn.fetchrow(query, signal_id)
         except asyncpg.PostgresError as exc:
-            self._logger.exception("Failed to fetch signal by id", signal_id=str(signal_id))
+            self._logger.exception(
+                "Failed to fetch signal by id",
+                signal_id=str(signal_id),
+            )
             raise DatabaseError(
                 "Failed to fetch signal by id",
                 details={"signal_id": str(signal_id), "error": str(exc)},
@@ -194,7 +223,7 @@ class SignalRepository:
 
         :param limit: Максимальное количество записей.
         :param symbol: Опциональный фильтр по символу.
-        :param since: Опциональный фильтр по created_at >= since.
+        :param since: Опциональный фильтр по created_at >= since (UTC).
         :return: Список сигналов, отсортированных по created_at DESC.
         :raises DatabaseError: при ошибках уровня БД.
         """
@@ -258,28 +287,25 @@ class SignalRepository:
     async def update_error(
         self,
         signal_id: UUID,
-        *,
         error_code: Optional[int],
         error_message: Optional[str],
     ) -> Signal:
         """
-        Обновить поля error_code и error_message для сигнала.
+        Обновить ошибочные поля сигнала (error_code, error_message).
 
-        Используется после обработки сигнала, когда нужно зафиксировать
-        результат (например, отказ по риск-лимитам или ошибку выставления ордера).
+        Используется для фиксации ошибок при обработке сигналов в execution-слое.
 
         :param signal_id: Идентификатор сигнала.
-        :param error_code: Код ошибки (или None для сброса).
-        :param error_message: Текст ошибки (или None).
-        :return: Обновлённый сигнал.
-        :raises DatabaseError: если сигнал не найден или при ошибках БД.
+        :param error_code: Код ошибки (или None для очистки).
+        :param error_message: Сообщение об ошибке (или None для очистки).
+        :return: Обновлённый Signal.
+        :raises DatabaseError: при ошибках уровня БД.
         """
         pool = self._get_pool()
 
         query = """
             UPDATE signals
-            SET
-                error_code = $2,
+            SET error_code = $2,
                 error_message = $3
             WHERE id = $1
             RETURNING *
@@ -303,6 +329,7 @@ class SignalRepository:
             self._logger.exception(
                 "Failed to update signal error fields",
                 signal_id=str(signal_id),
+                error_code=error_code,
             )
             raise DatabaseError(
                 "Failed to update signal error fields",
