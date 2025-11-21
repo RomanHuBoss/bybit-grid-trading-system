@@ -46,9 +46,10 @@ class Metrics:
             "Total number of positions opened.",
             ("symbol", "side"),
         )
-        self._win_rate: Gauge = Gauge(
-            "win_rate",
-            "Win rate over a rolling window (0..1).",
+        # Имя метрики win-rate выровнено с docs/alerting_rules.md (strategy_wr)
+        self._strategy_wr: Gauge = Gauge(
+            "strategy_wr",
+            "Strategy win rate over a rolling window (0..1).",
             ("window_days",),
         )
         self._profit_factor: Gauge = Gauge(
@@ -56,8 +57,9 @@ class Metrics:
             "Profit factor over a rolling window.",
             ("window_days",),
         )
-        self._max_drawdown: Gauge = Gauge(
-            "max_drawdown",
+        # Имя метрики MaxDD выровнено с docs/alerting_rules.md (strategy_max_drawdown)
+        self._strategy_max_drawdown: Gauge = Gauge(
+            "strategy_max_drawdown",
             "Maximum drawdown of the strategy (fraction or percent).",
         )
 
@@ -126,7 +128,8 @@ class Metrics:
             raise ValueError("value must be in [0.0, 1.0].")
 
         labels: Labels = {"window_days": str(window_days)}
-        self._win_rate.labels(**labels).set(value)
+        # Метрика strategy_wr — источник для алерта wr_drop
+        self._strategy_wr.labels(**labels).set(value)
 
     def set_profit_factor(self, window_days: int, value: float) -> None:
         """
@@ -150,7 +153,8 @@ class Metrics:
         if value_pct < 0:
             raise ValueError("value_pct must be non-negative.")
 
-        self._max_drawdown.set(value_pct)
+        # Метрика strategy_max_drawdown — источник для алерта max_drawdown_exceeded
+        self._strategy_max_drawdown.set(value_pct)
 
     # -------- Инфраструктурные метрики --------
 
@@ -158,7 +162,7 @@ class Metrics:
         """
         Инкрементирует счётчик reconnect'ов WebSocket по каналу.
 
-        :param channel: Имя WS-канала (например, "kline.BTCUSDT").
+        :param channel: Логическое имя/тип канала (например, "kline", "orders").
         """
         if not channel:
             raise ValueError("channel must be non-empty.")
