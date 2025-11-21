@@ -6,7 +6,14 @@ from pathlib import Path
 from typing import Dict, Optional
 from uuid import UUID, uuid4
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    FieldValidationInfo,
+    field_validator,
+    model_validator,
+)
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from src.core.exceptions import InvalidCandleError
@@ -69,7 +76,6 @@ class RiskConfig(BaseModel):
     )
 
     @field_validator("max_total_risk_r")
-    @classmethod
     def _check_max_total_risk_r(cls, v: Decimal) -> Decimal:
         if v <= 0:
             raise ValueError("max_total_risk_r must be positive")
@@ -110,8 +116,7 @@ class DBConfig(BaseModel):
     pool_max_size: int = Field(10, ge=1)
 
     @field_validator("pool_max_size")
-    @classmethod
-    def _check_pool_sizes(cls, max_size: int, info) -> int:
+    def _check_pool_sizes(cls, max_size: int, info: FieldValidationInfo) -> int:
         """
         Гарантирует, что максимальный размер пула не меньше минимального.
         """
@@ -170,7 +175,6 @@ class AVI5Config(BaseModel):
     )
 
     @field_validator("theta")
-    @classmethod
     def _validate_theta(cls, v: float) -> float:
         # В требованиях θ примерно в [0.15, 0.50], здесь мягко ограничиваем (0, 1].
         if not (0.0 < v <= 1.0):
@@ -212,7 +216,7 @@ class ConfirmedCandle(BaseModel):
     )
 
     @model_validator(mode="after")
-    def _sanity_check(self) -> ConfirmedCandle:
+    def _sanity_check(self) -> "ConfirmedCandle":
         """
         Проводит sanity-check OHLCV и статуса подтверждения.
 
@@ -293,7 +297,7 @@ class Signal(BaseModel):
     symbol: str = Field(..., min_length=1)
     direction: str = Field(
         ...,
-        regex="^(long|short)$",
+        pattern="^(long|short)$",
         description="Направление сделки по сигналу: long / short.",
     )
     entry_price: Decimal = Field(
@@ -351,7 +355,6 @@ class Signal(BaseModel):
     )
 
     @field_validator("tp1", "tp2", "tp3", "stop_loss")
-    @classmethod
     def _check_price_non_negative(cls, v: Optional[Decimal]) -> Optional[Decimal]:
         if v is not None and v <= 0:
             raise ValueError("Price levels must be positive")
@@ -380,7 +383,7 @@ class Position(BaseModel):
     direction: str = Field(
         ...,
         alias="side",
-        regex="^(long|short)$",
+        pattern="^(long|short)$",
         description="Направление позиции: long / short.",
     )
 
@@ -443,14 +446,12 @@ class Position(BaseModel):
     )
 
     @field_validator("size_base", "size_quote")
-    @classmethod
     def _check_size_positive(cls, v: Decimal) -> Decimal:
         if v <= 0:
             raise ValueError("Position size must be positive")
         return v
 
     @field_validator("fill_ratio")
-    @classmethod
     def _check_fill_ratio(cls, v: Decimal) -> Decimal:
         if v < 0 or v > 1:
             raise ValueError("fill_ratio must be within [0, 1]")
@@ -474,7 +475,6 @@ class RiskLimits(BaseModel):
     )
 
     @field_validator("per_symbol_risk_r")
-    @classmethod
     def _check_per_symbol_limits(
         cls,
         v: Dict[str, Decimal],
@@ -499,7 +499,7 @@ class SlippageRecord(BaseModel):
     symbol: str = Field(..., min_length=1)
     direction: str = Field(
         ...,
-        regex="^(long|short)$",
+        pattern="^(long|short)$",
     )
 
     expected_price: Decimal = Field(
