@@ -130,6 +130,17 @@ class DatabaseError(AlgoGridBaseException):
     pass
 
 
+class ExecutionError(AlgoGridBaseException):
+    """
+    Ошибка исполнения какой-то операции.
+
+    Варианты:
+        - Signal entry_price must be positive to open position,
+        - Bybit did not return orderId in create-order response,
+        - Failed to parse numeric fields from Bybit order response.
+    """
+    pass
+
 class ConfigLoadError(AlgoGridBaseException):
     """
     Ошибка загрузки или валидации конфигурации приложения.
