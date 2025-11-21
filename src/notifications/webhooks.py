@@ -1,207 +1,292 @@
-# src/notifications/webhooks.py
-
 from __future__ import annotations
 
 import asyncio
 import hashlib
 import hmac
 import json
+from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Mapping, Optional, Sequence
 
-from aiohttp import ClientError, ClientSession
+import httpx
 
-from src.core.exceptions import WebhookError, WebhookHTTPError
 from src.core.logging_config import get_logger
-from src.core.models import Position
+
+__all__ = ["WebhookEndpoint", "WebhookNotifier"]
+
+logger = get_logger("notifications.webhooks")
+
+
+@dataclass(frozen=True)
+class WebhookEndpoint:
+    """
+    Описание одного webhook-приёмника.
+
+    name    — человекочитаемое имя (например, "slack-trading");
+    url     — полный URL endpoint'а;
+    secret  — опциональный секрет для HMAC-подписи;
+    enabled — если False, endpoint игнорируется.
+    """
+
+    name: str
+    url: str
+    secret: Optional[str] = None
+    enabled: bool = True
 
 
 class WebhookNotifier:
     """
-    Отправка webhook-уведомлений во внешний сервис (Telegram/Slack и т.п.).
+    Асинхронный нотификатор внешних систем через HTTP webhooks.
 
-    Экземпляр конфигурируется URL, секретом для HMAC-подписи и простой retry-политикой.
-    Жизненным циклом ClientSession управляет вызывающая сторона.
+    Обязанности:
+      - формировать единый envelope:
+            {
+              "event_type": "...",
+              "timestamp": "...",   # ISO8601 UTC
+              "strategy": "AVI-5",
+              "environment": "...",
+              "data": {...}        # доменный payload
+            }
+      - подписывать тело HMAC-SHA256 при наличии секрета;
+      - отправлять в несколько endpoints параллельно с ограничением concurrency;
+      - реализовывать retries/backoff для временных ошибок.
+
+    Внешняя API:
+      - notify(event_type, payload, context) — high-level метод, который
+        отправит уведомление во все включённые endpoints.
     """
 
     def __init__(
         self,
-        session: ClientSession,
-        url: str,
-        secret: str,
-        timeout: float = 5.0,
+        endpoints: Sequence[WebhookEndpoint],
+        *,
+        strategy_name: str = "AVI-5",
+        environment: str = "prod",
+        timeout_seconds: float = 3.0,
         max_retries: int = 3,
+        concurrency_limit: int = 5,
     ) -> None:
-        if not url:
-            raise ValueError("Webhook URL must not be empty")
-        if timeout <= 0:
-            raise ValueError("Webhook timeout must be positive")
-        if max_retries < 1:
-            raise ValueError("max_retries must be >= 1")
+        self._endpoints = [ep for ep in endpoints if ep.enabled]
+        self._strategy_name = strategy_name
+        self._environment = environment
+        self._timeout = timeout_seconds
+        self._max_retries = max(0, max_retries)
+        self._semaphore = asyncio.Semaphore(max(1, concurrency_limit))
 
-        self._session = session
-        self._url = url
-        self._secret = secret
-        self._timeout = timeout
-        self._max_retries = max_retries
+    # ------------------------------------------------------------------ #
+    # Публичный API                                                      #
+    # ------------------------------------------------------------------ #
 
-    def _sign_payload(self, payload: Dict[str, Any]) -> str:
+    async def notify(
+        self,
+        event_type: str,
+        payload: Mapping[str, Any],
+        context: Optional[Mapping[str, Any]] = None,
+    ) -> None:
         """
-        Подписывает payload с помощью HMAC-SHA256.
+        Отправить уведомление о событии во все активные webhook endpoints.
 
-        Используется детерминированное JSON-представление (отсортированные ключи),
-        чтобы подпись не зависела от порядка ключей.
+        :param event_type: Тип события (например, "signal_opened", "kill_switch").
+        :param payload: Доменный payload события.
+        :param context: Дополнительный контекст (user_id, account_id, и т.п.).
 
-        :raises ValueError: если секрет пустой.
+        Ошибки доставки **не** пробрасываются наружу: они логируются по каждому
+        endpoint отдельно. Критический путь работы стратегии не должен падать
+        из-за проблем внешних интеграций.
         """
-        if not self._secret:
-            raise ValueError("Webhook secret must not be empty")
+        if not self._endpoints:
+            return
 
-        body = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
-        mac = hmac.new(self._secret.encode("utf-8"), body, hashlib.sha256)
-        return mac.hexdigest()
+        envelope = self._build_envelope(event_type=event_type, payload=payload, context=context)
+        body = json.dumps(envelope, default=str).encode("utf-8")
 
-    async def send(self, payload: Dict[str, Any]) -> None:
+        async with httpx.AsyncClient(timeout=self._timeout) as client:
+            tasks = [
+                self._send_to_endpoint(client, endpoint, event_type, body)
+                for endpoint in self._endpoints
+            ]
+            # Собираем все результаты, но исключения внутри обрабатываем сами.
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    # ------------------------------------------------------------------ #
+    # Внутренние помощники                                               #
+    # ------------------------------------------------------------------ #
+
+    def _build_envelope(
+        self,
+        *,
+        event_type: str,
+        payload: Mapping[str, Any],
+        context: Optional[Mapping[str, Any]],
+    ) -> Mapping[str, Any]:
         """
-        Отправка произвольного JSON-payload на сконфигурированный webhook.
+        Сформировать единый envelope для вебхука.
 
-        Используется AlertManager-ом и другими компонентами, которым нужен
-        общий механизм отправки с подписью и retry.
-
-        :raises WebhookError: при сетевых ошибках или исчерпании ретраев.
-        :raises WebhookHTTPError: при неуспешном HTTP-статусе (4xx/5xx).
+        Структура:
+            {
+              "event_type": "...",
+              "timestamp": "...",   # ISO8601 UTC
+              "strategy": "AVI-5",
+              "environment": "...",
+              "data": {...},
+              "context": {...}      # опционально
+            }
         """
-        signature = self._sign_payload(payload)
+        now = datetime.now(timezone.utc).isoformat()
+
+        envelope: dict[str, Any] = {
+            "event_type": event_type,
+            "timestamp": now,
+            "strategy": self._strategy_name,
+            "environment": self._environment,
+            "data": dict(payload),
+        }
+
+        if context:
+            envelope["context"] = dict(context)
+
+        return envelope
+
+    @staticmethod
+    def _compute_signature(secret: str, body: bytes) -> str:
+        """
+        Посчитать HMAC-SHA256 подпись для тела запроса.
+
+        Возвращается hex-строка, которая кладётся в заголовок `X-Webhook-Signature`.
+        """
+        digest = hmac.new(secret.encode("utf-8"), body, hashlib.sha256).hexdigest()
+        return digest
+
+    async def _send_to_endpoint(
+        self,
+        client: httpx.AsyncClient,
+        endpoint: WebhookEndpoint,
+        event_type: str,
+        body: bytes,
+    ) -> None:
+        """
+        Отправить уведомление в конкретный endpoint с retry/backoff.
+
+        Ретраи выполняются только для:
+            - сетевых ошибок (httpx.RequestError),
+            - ответов 5xx.
+
+        4xx считаем неретрабельными (ошибка конфигурации/формата).
+        """
+        if not endpoint.enabled:
+            return
+
         headers = {
             "Content-Type": "application/json",
-            "X-Signature": signature,
+            "X-Webhook-Event": event_type,
         }
 
-        last_exc: Optional[BaseException] = None
+        if endpoint.secret:
+            signature = self._compute_signature(endpoint.secret, body)
+            headers["X-Webhook-Signature"] = signature
 
-        for attempt in range(1, self._max_retries + 1):
+        attempt = 0
+        while True:
             try:
-                async with (self._session.post(
-                    self._url,
-                    json=payload,
-                    timeout=self._timeout,
-                    headers=headers,
-                ) as resp):
-                    if 200 <= resp.status < 300:
-                        # Успешный ответ — выходим.
-                        return
+                async with self._semaphore:
+                    response = await client.post(endpoint.url, content=body, headers=headers)
 
-                    body_text = await resp.text()
-                    logger = get_logger("notifications.webhooks")
+                status_code = response.status_code
+
+                if 200 <= status_code < 300:
+                    # Успех — логируем на уровне debug.
+                    logger.debug(
+                        "Webhook delivered",
+                        extra={
+                            "endpoint": endpoint.name,
+                            "url": endpoint.url,
+                            "status_code": status_code,
+                            "event_type": event_type,
+                        },
+                    )
+                    return
+
+                # 4xx — неретрабельные ошибки, кроме 429 (можно рассматривать отдельно).
+                if 400 <= status_code < 500 and status_code != 429:
                     logger.error(
-                        "webhook_http_error",
-                        url=self._url,
-                        status=resp.status,
-                        body=body_text,
-                        attempt=attempt
+                        "Non-retriable webhook error",
+                        extra={
+                            "endpoint": endpoint.name,
+                            "url": endpoint.url,
+                            "status_code": status_code,
+                            "body": response.text[:500],
+                            "event_type": event_type,
+                        },
                     )
-                    last_exc = WebhookHTTPError(
-                        f"Webhook responded with HTTP {resp.status}",
-                        details={"status": resp.status, "body": body_text},
+                    return
+
+                # 5xx или 429 — кандидат на retry.
+                attempt += 1
+                if attempt > self._max_retries:
+                    logger.error(
+                        "Webhook delivery failed after retries",
+                        extra={
+                            "endpoint": endpoint.name,
+                            "url": endpoint.url,
+                            "status_code": status_code,
+                            "event_type": event_type,
+                        },
                     )
-            except (ClientError, asyncio.TimeoutError) as exc:
-                # Сетевые/таймаут-ошибки — логируем и готовим WebhookError.
-                logger = get_logger("notifications.webhooks")
+                    return
+
+                backoff = 0.5 * (2 ** (attempt - 1))  # 0.5, 1.0, 2.0, ...
+                logger.warning(
+                    "Transient webhook error, will retry",
+                    extra={
+                        "endpoint": endpoint.name,
+                        "url": endpoint.url,
+                        "status_code": status_code,
+                        "attempt": attempt,
+                        "max_retries": self._max_retries,
+                        "backoff_seconds": backoff,
+                        "event_type": event_type,
+                    },
+                )
+                await asyncio.sleep(backoff)
+
+            except httpx.RequestError as exc:
+                # Сетевые ошибки → тоже ретраи, пока не исчерпаем лимит.
+                attempt += 1
+                if attempt > self._max_retries:
+                    logger.error(
+                        "Webhook delivery failed due to network error after retries",
+                        extra={
+                            "endpoint": endpoint.name,
+                            "url": endpoint.url,
+                            "error": str(exc),
+                            "event_type": event_type,
+                        },
+                    )
+                    return
+
+                backoff = 0.5 * (2 ** (attempt - 1))
+                logger.warning(
+                    "Network error while sending webhook, will retry",
+                    extra={
+                        "endpoint": endpoint.name,
+                        "url": endpoint.url,
+                        "error": str(exc),
+                        "attempt": attempt,
+                        "max_retries": self._max_retries,
+                        "backoff_seconds": backoff,
+                        "event_type": event_type,
+                    },
+                )
+                await asyncio.sleep(backoff)
+            except Exception as exc:  # noqa: BLE001
+                # Любая другая ошибка — логируем и выходим без ретраев.
                 logger.error(
-                    "webhook_send_error",
-                    url=self._url,
-                    attempt=attempt,
-                    error=str(exc)
+                    "Unexpected error while sending webhook",
+                    extra={
+                        "endpoint": endpoint.name,
+                        "url": endpoint.url,
+                        "error": str(exc),
+                        "event_type": event_type,
+                    },
                 )
-                last_exc = WebhookError(
-                    "Failed to send webhook request",
-                    details={"error": str(exc), "attempt": attempt},
-                )
-
-            if attempt < self._max_retries:
-                # Простейший backoff: 1с, 2с, 3с, ...
-                await asyncio.sleep(attempt)
-            else:
-                break
-
-        # Все попытки исчерпаны — пробрасываем последнее исключение.
-        if last_exc is not None:
-            raise last_exc
-
-        # Теоретически сюда не должны попасть, но оставляем safety-net.
-        raise WebhookError("Unknown webhook error without exception context")
-
-    async def send_be_event(
-        self,
-        position: Position,
-        triggered_at: Optional[datetime] = None,
-    ) -> None:
-        """
-        Отправка BE-события согласно спецификации формата:
-
-        {
-            "event": "be_triggered",
-            "position_id": "...",
-            "symbol": "BTCUSDT",
-            "at": "2025-01-01T00:00:00Z"
-        }
-
-        :param position: доменная модель позиции.
-        :param triggered_at: момент срабатывания BE; по умолчанию — сейчас (UTC).
-        :raises WebhookError: при проблемах с формированием payload.
-        :raises WebhookHTTPError: при неуспешном HTTP-ответе.
-        """
-        if triggered_at is None:
-            triggered_at = datetime.now(timezone.utc)
-
-        # Аккуратно вытаскиваем id и symbol, чтобы не завязываться жёстко
-        # на конкретные имена полей, но всё же валидировать их наличие.
-        position_id = getattr(position, "id", None)
-        if position_id is None:
-            position_id = getattr(position, "position_id", None)
-
-        symbol = getattr(position, "symbol", None)
-
-        if position_id is None:
-            raise WebhookError(
-                "Position id is missing for BE event payload",
-                details={"position": repr(position)},
-            )
-
-        if symbol is None:
-            raise WebhookError(
-                "Position symbol is missing for BE event payload",
-                details={"position": repr(position)},
-            )
-
-        payload: Dict[str, Any] = {
-            "event": "be_triggered",
-            "position_id": str(position_id),
-            "symbol": symbol,
-            "at": triggered_at.astimezone(timezone.utc)
-            .replace(tzinfo=timezone.utc)
-            .isoformat()
-            .replace("+00:00", "Z"),
-        }
-
-        await self.send(payload)
-
-
-async def send(
-    position: Position,
-    triggered_at: Optional[datetime],
-    notifier: WebhookNotifier,
-) -> None:
-    """
-    Фасад для совместимости с использованием из RiskManager:
-
-    - в спецификации `generate_be_event` ссылается на `notifications.webhooks.send`.
-
-    Предполагается, что вызывающий код управляет созданием и переиспользованием
-    экземпляра WebhookNotifier (URL, секрет, retry-политика и т.д.).
-
-    :param position: позиция, по которой сработал BE-ивент.
-    :param triggered_at: момент срабатывания BE.
-    :param notifier: сконфигурированный WebhookNotifier.
-    """
-    await notifier.send_be_event(position=position, triggered_at=triggered_at)
+                return
