@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from fastapi import FastAPI as FastAPIBase
+from prometheus_client import make_asgi_app
 from redis.asyncio import Redis
 from starlette.datastructures import State
 
@@ -24,14 +25,8 @@ from src.db.connection import close_pool, init_pool
 class FastAPI(FastAPIBase):
     """
     Расширенный тип FastAPI с явно типизированным app.state
-    для IDE/линтеров.
-
-    В состоянии приложения мы храним:
-    - config_loader: ConfigLoader
-    - config: AppConfig
-    - redis: Redis
-
-    Это используется DI-хелперами в HTTP-слое (см. src/api/routes/*).
+    для IDE/линтеров. Типизированное состояние полезно, так как
+    мы складываем туда config, config_loader и Redis-клиент.
     """
 
     state: State
@@ -42,36 +37,29 @@ logger = get_logger("main")
 
 def _resolve_db_dsn(config: AppConfig) -> str:
     """
-    Получить DSN для PostgreSQL из конфигурации или переменных окружения.
+    Получить DSN для PostgreSQL из конфига или переменных окружения.
 
-    Приоритет источников:
-
-    1) config.db.dsn — основной контракт, определённый в config/schema.py
-       и settings.yaml (секция db);
-    2) переменная окружения DATABASE_URL — основной путь для деплоя
-       (см. docker-compose и docs/deployment.md);
-    3) переменная окружения DB_DSN — legacy-алиас для обратной совместимости
-       со старыми конфигурациями.
+    Приоритет источников (см. docs/deployment.md):
+    1) config.db.dsn (pydantic-модель или dict);
+    2) переменная окружения DATABASE_URL (основной контракт);
+    3) переменная окружения DB_DSN (legacy-алиас).
 
     Если ничего не найдено — бросаем RuntimeError, чтобы приложение
-    не стартовало в неконсистентной конфигурации (см. требования к RTO/RPO
-    и управляемой деградации в project_overview.md).
+    не стартовало в неконсистентной конфигурации.
     """
     db_section: Any = getattr(config, "db", None)
 
     dsn: Optional[str] = None
 
     if db_section is not None:
-        # db_section может быть pydantic-моделью DBConfig или dict после
-        # сериализации — поддерживаем оба варианта.
+        # Поддерживаем и pydantic-модели, и dict-подобные структуры
         if hasattr(db_section, "dsn"):
-            dsn = getattr(db_section, "dsn", None)  # type: ignore[assignment]
+            dsn = getattr(db_section, "dsn", None)
         elif isinstance(db_section, dict):
             dsn = db_section.get("dsn")  # type: ignore[assignment]
 
     if not dsn:
-        # Основной путь из документации — DATABASE_URL.
-        # Дополнительно поддерживаем DB_DSN как технический алиас.
+        # Основной путь из документации — DATABASE_URL
         dsn = os.getenv("DATABASE_URL") or os.getenv("DB_DSN")
 
     if not dsn:
@@ -85,16 +73,14 @@ def _resolve_db_dsn(config: AppConfig) -> str:
 
 def _resolve_redis_dsn(config: AppConfig) -> str:
     """
-    Получить DSN для Redis из конфигурации или переменных окружения.
+    Получить DSN для Redis из конфига или переменных окружения.
 
-    Приоритет источников:
+    Приоритет источников (см. docs/deployment.md):
+    1) config.redis.dsn (pydantic-модель или dict, если такая секция есть);
+    2) переменная окружения REDIS_URL (основной контракт);
+    3) переменная окружения REDIS_DSN (legacy-алиас).
 
-    1) config.redis.dsn (если такая секция добавлена в AppConfig);
-    2) переменная окружения REDIS_URL — основной путь из deployment-доков;
-    3) переменная окружения REDIS_DSN — legacy-алиас для обратной совместимости.
-
-    Если ничего не найдено — бросаем RuntimeError, чтобы приложение
-    не стартовало с “половинчатой” конфигурацией.
+    Если ничего не найдено — бросаем RuntimeError.
     """
     redis_section: Any = getattr(config, "redis", None)
 
@@ -102,13 +88,11 @@ def _resolve_redis_dsn(config: AppConfig) -> str:
 
     if redis_section is not None:
         if hasattr(redis_section, "dsn"):
-            dsn = getattr(redis_section, "dsn", None)  # type: ignore[assignment]
+            dsn = getattr(redis_section, "dsn", None)
         elif isinstance(redis_section, dict):
             dsn = redis_section.get("dsn")  # type: ignore[assignment]
 
     if not dsn:
-        # Основной путь из документации — REDIS_URL.
-        # REDIS_DSN оставляем как внутренний алиас.
         dsn = os.getenv("REDIS_URL") or os.getenv("REDIS_DSN")
 
     if not dsn:
@@ -124,14 +108,13 @@ def _create_config_loader(config_path: str | Path | None = None) -> ConfigLoader
     """
     Создать ConfigLoader с путём до YAML-конфига.
 
-    Приоритет выбора пути (см. project_overview.md и file_creation_sequence.md):
-
+    Приоритет выбора пути (см. общую документацию по конфигурации):
     1) явный аргумент `config_path` (см. create_app);
     2) переменная окружения APP_CONFIG_PATH;
     3) дефолт `config/settings.yaml` (контракт проекта).
 
-    ConfigLoader далее сам разворачивает плейсхолдеры вида ${VAR}
-    и применяет env-override (TRADING__*, RISK__* и т.п.).
+    Таким образом код согласован с описанием create_app(...) и с самим
+    ConfigLoader, у которого такой же дефолт.
     """
     if config_path is not None:
         resolved = Path(config_path)
@@ -151,20 +134,14 @@ async def lifespan(application: FastAPI):
     Жизненный цикл приложения FastAPI.
 
     На старте:
-
-    - настраиваем логирование;
-    - создаём загрузчик конфигурации и читаем AppConfig;
-    - инициализируем пул PostgreSQL;
+    - настраиваем логирование,
+    - создаём загрузчик конфигурации и читаем AppConfig,
+    - инициализируем пул PostgreSQL,
     - создаём подключение к Redis и кладём его в application.state.
 
     На остановке:
-
-    - аккуратно закрываем пул PostgreSQL;
+    - аккуратно закрываем пул PostgreSQL,
     - закрываем подключение к Redis.
-
-    Это соответствует операционным требованиям и runbook’ам:
-    при ошибке инициализации вылетаем рано, при shutdown — стараемся
-    максимально корректно освободить ресурсы.
     """
     # --- logging -------------------------------------------------------------
     log_level = os.getenv("LOG_LEVEL", "INFO")
@@ -173,41 +150,39 @@ async def lifespan(application: FastAPI):
     logger.info("Logging initialized", log_level=log_level, log_file=log_file)
 
     # --- config --------------------------------------------------------------
-    # create_app может передать явный путь до settings.yaml через state.
-    state_config_path: Optional[Path] = getattr(application.state, "config_path", None)
+    # create_app может передать явный путь до settings.yaml через state
+    state_config_path: Path | None = getattr(application.state, "config_path", None)
     config_loader = _create_config_loader(config_path=state_config_path)
     config = config_loader.get_config()
 
     application.state.config_loader = config_loader
     application.state.config = config
-
-    logger.info("AppConfig loaded")
+    logger.info("Application config loaded")
 
     # --- PostgreSQL ----------------------------------------------------------
     db_dsn = _resolve_db_dsn(config)
     await init_pool(db_dsn)
-    logger.info("PostgreSQL pool initialized")
+    logger.info("PostgreSQL pool initialized", extra={"db_dsn": db_dsn})
 
     # --- Redis ---------------------------------------------------------------
     redis_dsn = _resolve_redis_dsn(config)
     redis = Redis.from_url(redis_dsn)
-    # Храним Redis в состоянии приложения для DI-хелперов
-    # (см. admin.get_redis, stream router).
+    # Храним Redis в состоянии приложения для DI-хелперов (см. admin.get_redis, stream router)
     application.state.redis = redis
-    logger.info("Redis client initialized", redis_dsn=redis_dsn)
+    logger.info("Redis client initialized", extra={"redis_dsn": redis_dsn})
 
     try:
-        # Передаём управление обработчикам FastAPI.
+        # Передаём управление FastAPI
         yield
     finally:
         # --- shutdown: Redis -------------------------------------------------
-        redis_obj: Optional[Redis] = getattr(application.state, "redis", None)
+        redis_obj: Redis | None = getattr(application.state, "redis", None)
         if redis_obj is not None:
             try:
                 await redis_obj.close()
                 logger.info("Redis client closed")
             except Exception:  # noqa: BLE001
-                # На shutdown важнее не уронить приложение ещё раз.
+                # На shutdown важнее не уронить приложение ещё раз
                 logger.exception("Error while closing Redis client")
 
         # --- shutdown: PostgreSQL -------------------------------------------
@@ -215,7 +190,7 @@ async def lifespan(application: FastAPI):
             await close_pool()
             logger.info("PostgreSQL pool closed")
         except RuntimeError:
-            # Пул мог не успеть инициализироваться или уже быть закрыт.
+            # Пул мог не успеть инициализироваться или уже быть закрыт
             logger.debug("PostgreSQL pool was not open on shutdown")
         except Exception:  # noqa: BLE001
             logger.exception("Error while closing PostgreSQL pool")
@@ -229,15 +204,13 @@ def create_app(config_path: str | Path | None = None) -> FastAPI:
         config_path:
             Необязательный путь до файла конфигурации (обычно `config/settings.yaml`).
             Если не задан, используется APP_CONFIG_PATH или дефолт
-            `config/settings.yaml`, как описано в project_overview.md.
+            `config/settings.yaml`, как описано в документации по конфигурации.
 
-    Функция:
-
-    - подключает lifespan-менеджер, который инициализирует логирование,
-      конфиг, пул БД и Redis;
-    - прокидывает путь до конфига в app.state (чтобы lifespan его увидел);
-    - регистрирует REST API под базовым путём `/api/v1` (см. docs/api.md);
-    - регистрирует SSE-стрим `/stream` на корне (исключение из правила `/api/v1`).
+    Поведение:
+    - создаёт экземпляр FastAPI с кастомным lifespan;
+    - опционально прокидывает путь до конфига в app.state;
+    - монтирует эндпоинт Prometheus-метрик `/metrics` на корне;
+    - подключает все публичные роутеры API.
     """
     application = FastAPI(
         title="AVI-5 Algo-Grid API",
@@ -245,24 +218,28 @@ def create_app(config_path: str | Path | None = None) -> FastAPI:
         lifespan=lifespan,
     )
 
-    # Сохраняем путь до конфига в state, чтобы lifespan мог им воспользоваться.
+    # Сохраняем путь до конфига в state, чтобы lifespan мог им воспользоваться
     if config_path is not None:
         application.state.config_path = Path(config_path)
 
-    # Роутеры прикладного REST API — все под /api/v1 согласно docs/api.md.
-    application.include_router(health_router, prefix="/api/v1")
-    application.include_router(positions_router, prefix="/api/v1")
-    application.include_router(signals_router, prefix="/api/v1")
-    application.include_router(admin_router, prefix="/api/v1")
+    # Prometheus metrics endpoint at /metrics (see docs/api.md & docs/deployment.md)
+    application.mount("/metrics", make_asgi_app())
 
-    # SSE-стрим для UI / мониторинга остаётся на корне (`/stream`),
-    # как описано в разделе Streaming (docs/api.md).
+    # Роутеры прикладного API
+    # В документации базовый REST-префикс `/api/v1`, но он может быть
+    # реализован на уровне Ingress (pathPrefix). В текущей версии
+    # роутеры вешаются напрямую, пути соответствуют описанию без префикса.
+    application.include_router(health_router)
+    application.include_router(positions_router)
+    application.include_router(signals_router)
+    application.include_router(admin_router)
+    # SSE-стрим для UI / мониторинга (см. docs/api.md, раздел Streaming)
     application.include_router(stream_router)
 
     return application
 
 
-# Готовый экземпляр приложения для uvicorn / gunicorn / тестов.
+# Готовый экземпляр приложения для uvicorn / gunicorn / тестов
 app = create_app()
 
 
