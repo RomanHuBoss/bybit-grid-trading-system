@@ -5,7 +5,7 @@ import asyncio
 import json
 from typing import Any, AsyncGenerator
 
-from fastapi import APIRouter, Depends, Request, Header
+from fastapi import APIRouter, Depends, Header, Request
 from redis.asyncio import Redis
 from starlette.responses import StreamingResponse
 
@@ -67,6 +67,15 @@ async def _sse_event_stream(
         id: <envelope.id>
         event: <envelope.event>
         data: <JSON(envelope.data)>
+
+    Сырые сообщения ожидаются в "envelope"-формате, который формирует UINotifier:
+
+        {
+            "id": "<uuid>",
+            "event": "<тип_события>",
+            "timestamp": "<iso8601>",
+            "data": {...}
+        }
     """
     pubsub = redis.pubsub()
     await pubsub.subscribe(channel)
@@ -102,6 +111,8 @@ async def _sse_event_stream(
                 # В канале тихо — периодически шлём keep-alive, чтобы
                 # не было idle-таймаутов на балансерах / браузере.
                 if now - last_keepalive >= KEEPALIVE_INTERVAL_SEC:
+                    # Комментарий по SSE-спеке: не отображается в UI,
+                    # но держит соединение живым.
                     yield b": keepalive\n\n"
                     last_keepalive = now
                 continue
@@ -136,15 +147,27 @@ async def _sse_event_stream(
             chunk = ("\n".join(lines) + "\n\n").encode("utf-8")
             yield chunk
 
+    except asyncio.CancelledError:
+        # Стрим отменили (обычно клиент разорвал соединение / сервер гасится).
+        # Логируем и пробрасываем дальше, чтобы корректно завершить StreamingResponse.
+        logger.info("SSE stream task was cancelled")
+        raise
     finally:
+        # Важно корректно отписаться и закрыть pubsub, чтобы не протекали ресурсы.
         try:
             await pubsub.unsubscribe(channel)
         except Exception:  # noqa: BLE001
-            logger.exception("Error while unsubscribing from SSE Redis channel")
+            logger.exception(
+                "Error while unsubscribing from SSE Redis channel",
+                channel=channel,
+            )
         try:
             await pubsub.close()
         except Exception:  # noqa: BLE001
-            logger.exception("Error while closing Redis pubsub in SSE stream")
+            logger.exception(
+                "Error while closing Redis pubsub in SSE stream",
+                channel=channel,
+            )
 
 
 # --------------------------------------------------------------------------- #
