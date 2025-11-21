@@ -1,171 +1,108 @@
-"""
-Иерархия исключений для алгоритмической системы AVI-5.
+from __future__ import annotations
 
-Модуль определяет общий базовый класс исключений и набор
-доменных и инфраструктурных ошибок, которые от него наследуются.
-
-Каждое исключение содержит:
-    - человекочитаемое сообщение (message),
-    - опциональный словарь details с дополнительным контекстом
-      (для логирования, audit trail, алертинга и аналитики).
-"""
+from dataclasses import dataclass
+from typing import Any, Dict, Optional
 
 
-class AlgoGridBaseException(Exception):
+__all__ = [
+    "AppError",
+    "ConfigError",
+    "NetworkError",
+    "DatabaseError",
+    "ExecutionError",
+    "ExternalAPIError",
+    "WSConnectionError",
+]
+
+
+@dataclass
+class AppError(Exception):
     """
-    Базовый класс для всех бизнес- и инфраструктурных ошибок
-    в системе AVI-5.
+    Базовое исключение для всех доменных ошибок AVI-5.
 
     Атрибуты:
-        message: Строковое описание ошибки для человека.
-        details: Необязательный словарь с дополнительным
-                 структурированным контекстом
-                 (идентификаторы, полезная нагрузка, окружение).
+        message: Человеко-читаемое описание ошибки (одна строка).
+        details: Дополнительный структурированный контекст для логов /
+                 сериализации (id сущности, url, payload и т.п.).
     """
 
     message: str
-    details: dict[str, object]
+    details: Optional[Dict[str, Any]] = None
 
-    def __init__(self, message: str, *, details: dict[str, object] | None = None) -> None:
-        super().__init__(message)
-        self.message = message
-        self.details = details or {}
+    def __post_init__(self) -> None:
+        # Exception.__init__ ожидает строку в args[0]
+        super().__init__(self.message)
 
-    def __str__(self) -> str:
-        return self.message
+    def __str__(self) -> str:  # pragma: no cover - тривиальная логика
+        if not self.details:
+            return self.message
+        return f"{self.message} | details={self.details!r}"
 
 
-class InvalidCandleError(AlgoGridBaseException):
+class ConfigError(AppError):
     """
-    Ошибка валидации свечи (например, для DTO ConfirmedCandle).
-
-    Выбрасывается, если нарушены базовые проверки:
-        - цена закрытия вне диапазона [low, high],
-        - неположительный объём,
-        - флаг подтверждения отсутствует, когда требуется
-          подтверждённая свеча и т.п.
-    """
-    pass
-
-
-class SignalExpiredError(AlgoGridBaseException):
-    """
-    Сигнал считается протухшим/устаревшим.
-
-    Используется, когда сигнал пришёл позже допустимого
-    грайс-периода (например, ~5 секунд после закрытия бара)
-    и не должен больше участвовать в открытии новых позиций.
-    """
-    pass
-
-
-class RiskLimitExceeded(AlgoGridBaseException):
-    """
-    Превышены настроенные риск-лимиты.
+    Ошибка конфигурации приложения.
 
     Примеры:
-        - превышено допустимое количество одновременных позиций,
-        - превышена экспозиция по конкретному активу,
-        - превышена общая совокупная экспозиция системы.
+        - отсутствует обязательная переменная окружения;
+        - некорректный формат значения конфига;
+        - несовместимые параметры запуска.
     """
+
     pass
 
 
-class OrderPlacementError(AlgoGridBaseException):
+class NetworkError(AppError):
     """
-    Ошибка при размещении ордера на бирже.
+    Ошибка сетевого уровня (HTTP, WebSocket, DNS и т.п.).
 
-    Возможные причины:
-        - недостаточная маржа,
-        - некорректная цена или количество,
-        - валидационные ошибки на стороне Bybit
-          или другие отказы при приёме ордера.
+    Используется в тех местах, где есть надежда на успешный retry
+    (нестабильная сеть, временные проблемы у провайдера).
     """
+
     pass
 
 
-class RateLimitExceededError(AlgoGridBaseException):
+class DatabaseError(AppError):
     """
-    Превышен лимит частоты запросов (rate limit).
+    Ошибка при работе с базой данных.
 
-    Может относиться:
-        - к лимитам на стороне Bybit,
-        - к локальным лимитам на уровне приложения или IP.
+    Обычно оборачивает конкретные исключения драйвера (asyncpg, psycopg и т.п.),
+    не раскрывая детали наружу.
     """
+
     pass
 
 
-class WebhookError(AlgoGridBaseException):
+class ExecutionError(AppError):
     """
-    Ошибка при отправке вебхука.
+    Ошибка исполнения торговой логики / ордеров.
 
     Примеры:
-        - сетевые/транспортные ошибки,
-        - неуспешный HTTP-статус,
-        - ошибки формирования или подписи полезной нагрузки.
+        - не удалось открыть/закрыть позицию;
+        - невозможный сигнал (некорректная цена/объём);
+        - рассинхронизация состояния с биржей.
     """
-    pass
 
-class WebhookHTTPError(AlgoGridBaseException):
-    """
-    Ошибка при отправке вебхука.
-
-    Примеры:
-        - сетевые/транспортные ошибки,
-        - неуспешный HTTP-статус,
-        - ошибки формирования или подписи полезной нагрузки.
-    """
     pass
 
 
-class DatabaseError(AlgoGridBaseException):
+class ExternalAPIError(AppError):
     """
-    Ошибка уровня базы данных.
+    Обёртка над бизнес-ошибками внешних API (Bybit REST/WS, Slack, webhooks).
 
-    Варианты:
-        - проблемы с подключением,
-        - ошибки выполнения SQL-запросов,
-        - нарушения ограничений целостности или консистентности данных.
+    Внутри обычно хранится исходный код ошибки / тело ответа.
     """
+
     pass
 
 
-class ExecutionError(AlgoGridBaseException):
+class WSConnectionError(NetworkError):
     """
-    Ошибка исполнения какой-то операции.
+    Базовая ошибка WebSocket-подсистемы.
 
-    Варианты:
-        - Signal entry_price must be positive to open position,
-        - Bybit did not return orderId in create-order response,
-        - Failed to parse numeric fields from Bybit order response.
+    Любые проблемы с установлением / поддержанием WS-соединения
+    (как с биржей, так и с другими сервисами) должны наследоваться от неё.
     """
-    pass
 
-class ConfigLoadError(AlgoGridBaseException):
-    """
-    Ошибка загрузки или валидации конфигурации приложения.
-
-    Причины:
-        - отсутствует или повреждён файл конфигурации,
-        - некорректные переменные окружения,
-        - нарушения ограничений в моделях AppConfig/AVI5Config.
-    """
-    pass
-
-
-class WSConnectionError(AlgoGridBaseException):
-    """
-    Ошибка установления или поддержания WebSocket-соединения.
-
-    Примеры:
-        - таймаут при подключении,
-        - нештатное закрытие соединения,
-        - протокольные или аутентификационные ошибки.
-    """
-    pass
-
-class NetworkError(AlgoGridBaseException):
-    """
-    Ошибка работы с сетью в контексте BybitRESTClient
-    """
     pass
