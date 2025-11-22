@@ -52,8 +52,9 @@ services:
       - ../config/secrets.env
     environment:
       APP_ENV: "dev"
-      # URLы для коннекта к БД и Redis из приложения
-      DATABASE_URL: "postgresql+asyncpg://avi5:avi5@db:5432/avi5"
+      # DSN для asyncpg-коннекта к БД (используется src.db.connection)
+      DATABASE_URL: "postgresql://avi5:avi5@db:5432/avi5"
+      # URL для коннекта к Redis из приложения
       REDIS_URL: "redis://redis:6379/0"
     ports:
       - "8000:8000"
