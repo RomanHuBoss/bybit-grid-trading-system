@@ -6,7 +6,7 @@ import os
 import subprocess
 import sys
 import tarfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional, List
@@ -26,11 +26,12 @@ class BackupConfig:
     backup_dir: Path
     prefix: str = "avi5_full"
     s3_base_prefix: str = "avi5/full"
+    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
     @property
     def now(self) -> datetime:
-        """Текущее время в UTC."""
-        return datetime.now(timezone.utc)
+        """Текущее время в UTC, зафиксированное для данного backup-запуска."""
+        return self.created_at
 
     @property
     def timestamp(self) -> str:
@@ -67,7 +68,8 @@ def run_pg_dump(dsn: str, output_path: Path) -> Path:
     """
     output_path.parent.mkdir(parents=True, exist_ok=True)
     cmd = ["pg_dump", dsn, "-f", str(output_path)]
-    logger.info("Запуск pg_dump: %s", " ".join(cmd))
+    # Не логируем DSN целиком, чтобы не унести в логи пароль и прочие секреты.
+    logger.info("Запуск pg_dump, файл дампа: %s", output_path)
     subprocess.run(cmd, check=True)
     return output_path
 
@@ -112,7 +114,7 @@ def cleanup_old_backups(
     Удаляет старые backup’ы из S3 согласно политике хранения.
 
     Политика из спеки:
-    - в S3 backup’ы хранятся 90 дней;
+    - в S3 backup’ы хранятся retention_days (по умолчанию 90) дней;
     - удаляем объекты старше retention_days, не трогая «живую» цепочку WAL.
 
     :param bucket: Имя S3-бакета.
@@ -135,7 +137,7 @@ def cleanup_old_backups(
     continuation_token: Optional[str] = None
 
     while True:
-        list_kwargs = {
+        list_kwargs: dict[str, object] = {
             "Bucket": bucket,
             "Prefix": f"{s3_base_prefix}/",
         }
@@ -143,9 +145,9 @@ def cleanup_old_backups(
             list_kwargs["ContinuationToken"] = continuation_token
 
         response = s3_client.list_objects_v2(**list_kwargs)
-        contents = response.get("Contents", [])
+        contents = response.get("Contents", []) or []
 
-        objects_to_delete = []
+        objects_to_delete: list[dict[str, str]] = []
         for obj in contents:
             key = obj["Key"]
             last_modified = obj["LastModified"]  # datetime с TZ
@@ -221,11 +223,9 @@ def main(
     :param bucket: Имя S3-бакета.
     :param retention_days: Количество дней хранения backup’ов в S3.
     :param dsn: Строка подключения к БД.
-    :param backup_dir: Локальный каталог для хранения архивов.
-    :param prefix: Префикс имени файлов backup’а.
-    :param s3_base_prefix: Базовый префикс в S3 для полных backup’ов.
-    :raises subprocess.CalledProcessError: при ошибке pg_dump.
-    :raises ClientError: при ошибке S3.
+    :param backup_dir: Локальный каталог для архивов.
+    :param prefix: Префикс имени файла.
+    :param s3_base_prefix: Базовый префикс в S3.
     """
     if backup_dir is None:
         backup_dir = Path.cwd() / "backups"
@@ -262,7 +262,7 @@ def main(
     # 4. Очистка старых backup’ов в S3
     cleanup_old_backups(config.bucket, config.retention_days, config.s3_base_prefix, now=now)
 
-    # 5. Очистка локальных архивов (7 дней по умолчанию)
+    # 5. Очистка локального каталога backup’ов
     _cleanup_local_backups(backup_dir, keep_days=7, now=now)
 
     logger.info("Backup БД успешно завершён: %s", archive_path)
@@ -286,7 +286,7 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--dsn",
         required=False,
-        help="Строка подключения к БД (DSN). По умолчанию — DATABASE_URL или PG* переменные.",
+        help="Строка подключения к БД (DSN). По умолчанию — DATABASE_URL, DB_DSN или PG* переменные.",
     )
     parser.add_argument(
         "--retention-days",
@@ -305,7 +305,13 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
 
 def _resolve_dsn(cli_dsn: Optional[str]) -> str:
     """
-    Разрешает DSN по приоритету: CLI → DATABASE_URL → PG* переменные.
+    Определяет DSN для подключения к БД.
+
+    Приоритет источников:
+      1) Явный DSN из CLI (--dsn).
+      2) DATABASE_URL (основной контракт приложения).
+      3) DB_DSN (legacy-алиас).
+      4) Набор стандартных PG-переменных (PGHOST/PGPORT/PGUSER/PGPASSWORD/PGDATABASE).
 
     :param cli_dsn: DSN, переданный из командной строки.
     :return: Строка подключения.
@@ -314,7 +320,7 @@ def _resolve_dsn(cli_dsn: Optional[str]) -> str:
     if cli_dsn:
         return cli_dsn
 
-    env_dsn = os.getenv("DATABASE_URL")
+    env_dsn = os.getenv("DATABASE_URL") or os.getenv("DB_DSN")
     if env_dsn:
         return env_dsn
 
