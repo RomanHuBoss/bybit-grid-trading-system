@@ -144,3 +144,7 @@ class RateLimitExceededError(AppError):
     """
 
     pass
+
+class OrderPlacementError(AppError):
+    """Raised when order placement fails."""
+    pass
