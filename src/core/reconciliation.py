@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
-from typing import Dict, Iterable, List, Mapping, Optional, Tuple
+from typing import Dict, Iterable, List, Mapping, Tuple
 
 from redis.asyncio import Redis
 
@@ -27,10 +27,9 @@ class ReconciliationConfig:
         Как часто запускать reconciliation (используется внешним планировщиком).
         Здесь только как справочная информация/настройка.
     close_missing_in_db:
-        Если True — при обнаружении, что позиции в БД нет,
-        но она есть на бирже, логируем крит и НЕ трогаем биржу.
-        Если False — модуль никогда не инициирует действий по бирже
-        (в любом случае он не делает торговых операций).
+        Зарезервированный флаг на будущее. В текущей реализации модуль
+        никогда не инициирует действий по бирже и только логирует факт,
+        что позиция присутствует на бирже и отсутствует в БД.
     close_missing_on_exchange:
         Если True — при отсутствии позиции на бирже, но наличии в БД,
         позиция в БД помечается закрытой с closed_at=now.
@@ -61,7 +60,7 @@ class ReconciliationService:
         redis: Redis,
         rest_client: BybitRESTClient,
         position_repository: PositionRepository,
-        config: Optional[ReconciliationConfig] = None,
+        config: ReconciliationConfig | None = None,
         lock_name: str = "positions_reconciliation",
     ) -> None:
         self._redis = redis
@@ -188,6 +187,8 @@ class ReconciliationService:
     ) -> Dict[Tuple[str, str], Position]:
         """
         Индексация позиций из БД по ключу (symbol_upper, direction_lower).
+
+        Здесь `direction` — доменное направление позиции: long / short.
         """
         index: Dict[Tuple[str, str], Position] = {}
         for p in positions:
@@ -201,6 +202,12 @@ class ReconciliationService:
     ) -> Dict[Tuple[str, str], Mapping[str, object]]:
         """
         Индексация позиций с биржи по ключу (symbol_upper, direction_lower).
+
+        Bybit возвращает поле `side` в формате `Buy` / `Sell`. Для того,
+        чтобы ключи совпадали с доменной моделью Position (direction: long/short),
+        мы нормализуем значения:
+        - Buy/long  -> long
+        - Sell/short -> short
         """
         index: Dict[Tuple[str, str], Mapping[str, object]] = {}
         for row in positions:
@@ -209,10 +216,22 @@ class ReconciliationService:
             if not isinstance(symbol_raw, str) or not isinstance(side_raw, str):
                 continue
 
-            symbol = symbol_raw.upper()
-            # Bybit: Buy/Sell -> long/short (но здесь пока храним исходные значения).
-            side = side_raw.lower()
-            key = (symbol, side)
+            symbol = str(symbol_raw).upper()
+            side = str(side_raw).lower()
+            if side in ("buy", "long"):
+                direction = "long"
+            elif side in ("sell", "short"):
+                direction = "short"
+            else:
+                # Непонятное состояние — лучше залогировать и пропустить позицию.
+                logger.warning(
+                    "Unknown position side from exchange, skipping row",
+                    raw_side=side_raw,
+                    symbol=symbol_raw,
+                )
+                continue
+
+            key = (symbol, direction)
             index[key] = row
         return index
 
@@ -239,7 +258,7 @@ class ReconciliationService:
 
             symbol, direction = key
             logger.warning(
-                "Position present in DB but missing on exchange",
+                "DB position missing on exchange",
                 position_id=str(position.id),
                 symbol=symbol,
                 direction=direction,
@@ -272,14 +291,14 @@ class ReconciliationService:
             if key in db_index:
                 continue
 
-            symbol, side = key
+            symbol, direction = key
             size = row.get("size")
             entry_price = row.get("entryPrice") or row.get("avgPrice")
 
             logger.error(
                 "Position present on exchange but missing in DB",
                 symbol=symbol,
-                side=side,
+                direction=direction,
                 size=str(size),
                 entry_price=str(entry_price),
             )
@@ -337,7 +356,7 @@ class ReconciliationService:
     # ------------------------------------------------------------------ #
 
     @staticmethod
-    def _to_decimal(value: object) -> Optional[Decimal]:
+    def _to_decimal(value: object) -> Decimal | None:
         """
         Мягкое преобразование к Decimal.
 
