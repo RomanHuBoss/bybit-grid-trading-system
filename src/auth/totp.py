@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
+from typing import Optional
+
 from urllib.parse import quote
 
 logger = logging.getLogger(__name__)
@@ -13,120 +16,164 @@ except ImportError:  # pragma: no cover - в тестовой среде биб�
 # Отображаемое имя сервиса в приложении-аутентификаторе
 DEFAULT_TOTP_ISSUER = "AlgoGrid AVI-5"
 
+# Длина секрета по умолчанию (битовая энтропия соответствует рекомендациям pyotp/Google)
+DEFAULT_SECRET_LENGTH = 32
 
-def generate_secret() -> str:
-    """
-    Сгенерировать новый секрет для TOTP.
+# Количество 30-секундных окон, которое мы считаем валидным при проверке кода.
+# 1 окно = текущий интервал +/- 1 интервал (в сумме 3), что даёт допуск на небольшие расхождения часов.
+DEFAULT_VALID_WINDOW = 1
 
-    Секрет совместим с Google Authenticator (base32-строка).
-    Его следует шифровать и хранить в БД на стороне сервисного слоя.
+
+@dataclass(slots=True)
+class TOTPConfig:
     """
-    if pyotp is None:
+    Конфигурация TOTP-провайдера.
+
+    На случай, если в будущем потребуется переопределять параметры (длина секрета,
+    окно валидации и т.п.) из конфигурации приложения.
+    """
+
+    issuer: str = DEFAULT_TOTP_ISSUER
+    secret_length: int = DEFAULT_SECRET_LENGTH
+    valid_window: int = DEFAULT_VALID_WINDOW
+
+
+def _ensure_pyotp_available() -> None:
+    """
+    Убедиться, что библиотека pyotp доступна.
+
+    Если pyotp не установлена, поднимаем понятную ошибку конфигурации.
+    """
+    if pyotp is None:  # type: ignore[truthy-function]
         raise RuntimeError(
-            "pyotp is required for TOTP operations but is not installed"
+            "pyotp library is required for TOTP operations, but is not installed. "
+            "Install it with 'pip install pyotp' or отключите TOTP-аутентификацию "
+            "в настройках сервиса."
         )
 
-    # pyotp.random_base32 генерирует криптографически стойкую base32-строку
-    return pyotp.random_base32()  # type: ignore[attr-defined]
 
-
-def generate_uri(secret: str, email: str) -> str:
+def generate_totp_secret(config: Optional[TOTPConfig] = None) -> str:
     """
-    Сформировать otpauth:// URI для TOTP на основе секрета и e-mail пользователя.
+    Сгенерировать секрет для TOTP (base32-строка).
 
-    URI совместим с Google Authenticator и аналогичными клиентами, его можно
-    кодировать в QR и показывать пользователю.
+    Секрет сохраняется в БД пользователя и используется как основа
+    для всех последующих проверок кода аутентификатора.
 
-    :param secret: TOTP-секрет (base32).
-    :param email: E-mail пользователя, который будет отображаться в клиенте.
-    :raises TypeError: если secret или email не строки.
-    :raises RuntimeError: если pyotp недоступен в окружении.
+    :param config: Необязательная конфигурация TOTP. Если не передана —
+                   используется TOTPConfig по умолчанию.
+    :return: base32-строка секрета.
     """
-    if not isinstance(secret, str) or not isinstance(email, str):
-        raise TypeError("secret and email must be strings")
+    _ensure_pyotp_available()
+    cfg = config or TOTPConfig()
 
-    if pyotp is None:
-        raise RuntimeError(
-            "pyotp is required for TOTP operations but is not installed"
-        )
+    length = max(16, int(cfg.secret_length))  # минимальная разумная длина
+    # type: ignore[name-defined] — pyotp подгружается динамически.
+    secret = pyotp.random_base32(length=length)  # type: ignore[no-any-return]
 
-    # Библиотека pyotp сама сформирует корректный otpauth:// URI.
-    totp = _get_totp(secret)
-    # issuer_name отображается в аутентификаторе как название сервиса.
+    logger.debug("Generated new TOTP secret", extra={"secret_length": length})
+    return secret
+
+
+def build_provisioning_uri(
+    *,
+    secret: str,
+    account_label: str,
+    config: Optional[TOTPConfig] = None,
+) -> str:
+    """
+    Сформировать otpauth:// URI для передачи в мобильное приложение (через QR-код).
+
+    Именно этот URI кодируется в QR, который показывает фронтенд при включении 2FA.
+
+    :param secret: base32-секрет пользователя.
+    :param account_label: Метка аккаунта, которая будет отображаться в приложении
+                          (обычно email или "<login>@<env>").
+    :param config: Конфигурация TOTP (issuer, длина секрета и т.п.).
+    :return: Строка otpauth://totp/...
+    """
+    _ensure_pyotp_available()
+    cfg = config or TOTPConfig()
+
+    normalized_label = account_label.strip()
+    if not normalized_label:
+        raise ValueError("account_label must be a non-empty string")
+
+    # В соответствии со стандартной схемой: otpauth://totp/<issuer>:<label>?secret=...&issuer=...
+    # pyotp сам корректно сформирует URI с нужными параметрами.
+    # type: ignore[name-defined]
+    totp = pyotp.TOTP(secret)  # type: ignore[no-any-return]
     uri = totp.provisioning_uri(
-        name=email,
-        issuer_name=DEFAULT_TOTP_ISSUER,
+        name=normalized_label,
+        issuer_name=cfg.issuer,
     )
-    # На всякий случай проверим ожидаемый префикс.
-    if not uri.startswith("otpauth://totp/"):
-        # Это не критично для работы, но полезно залогировать.
-        logger.warning("Generated TOTP URI has unexpected format", extra={"uri_prefix": uri.split("?", 1)[0]})
+
+    logger.debug(
+        "Built TOTP provisioning URI",
+        extra={"label": normalized_label, "issuer": cfg.issuer},
+    )
     return uri
 
 
-def verify(code: str, secret: str) -> bool:
+def verify_totp_code(
+    *,
+    secret: str,
+    code: str,
+    config: Optional[TOTPConfig] = None,
+) -> bool:
     """
-    Проверить TOTP-код для заданного секрета.
+    Проверить TOTP-код, введённый пользователем.
 
-    Возвращает:
-      * True  — код корректен (в пределах допустимого временного окна).
-      * False — код неверен, просрочен, секрет битый или формат кода некорректен.
+    Валидация соответствует рекомендациям из документации:
+    - используем допуск по времени `valid_window` (по умолчанию 1 интервал);
+    - код нормализуем (удаляем пробелы, приводим к строке, проверяем формат).
 
-    :param code: Одноразовый код, введённый пользователем.
-    :param secret: TOTP-секрет (base32), соответствующий пользователю.
-    :raises TypeError: если входные значения не строки.
-    :raises RuntimeError: если pyotp недоступен в окружении.
+    :param secret: base32-секрет пользователя.
+    :param code: Код, введённый пользователем (обычно 6 цифр).
+    :param config: Конфигурация TOTP.
+    :return: True, если код валиден в текущем окне; иначе False.
     """
-    if not isinstance(code, str) or not isinstance(secret, str):
-        raise TypeError("code and secret must be strings")
+    _ensure_pyotp_available()
+    cfg = config or TOTPConfig()
 
-    if pyotp is None:
-        raise RuntimeError(
-            "pyotp is required for TOTP operations but is not installed"
+    # Нормализация: убираем пробелы и невидимые символы.
+    normalized_code = str(code).strip().replace(" ", "")
+
+    if not normalized_code.isdigit():
+        logger.info(
+            "TOTP code verification failed: non-numeric code",
+            extra={"code_length": len(normalized_code)},
         )
-
-    # Нормализуем ввод: убираем пробелы, возможные разделители.
-    normalized_code = code.replace(" ", "").strip()
-
-    # Простейшая валидация формата: 6-значный код.
-    if not (normalized_code.isdigit() and 6 <= len(normalized_code) <= 8):
-        # Не выбрасываем ошибок — просто считаем код неверным.
         return False
 
+    # type: ignore[name-defined]
+    totp = pyotp.TOTP(secret)  # type: ignore[no-any-return]
+    # valid_window — это количество дополнительных интервалов вокруг текущего,
+    # которые считаются допустимыми (для компенсации рассинхрона часов).
     try:
-        totp = _get_totp(secret)
-    except Exception:
-        # Битый секрет, неверный формат base32 и т.п. — для внешнего мира это просто "код неверен".
-        logger.warning("Failed to create TOTP instance from secret", exc_info=True)
+        # bool(...) на случай, если pyotp вернёт что-то не строгое.
+        is_valid = bool(totp.verify(normalized_code, valid_window=cfg.valid_window))
+    except Exception:  # noqa: BLE001
+        logger.exception("Unexpected error while verifying TOTP code")
         return False
 
-    try:
-        # valid_window=1 позволяет принимать соседние интервалы (±1 шаг)
-        # для небольшой погрешности времени между сервером и клиентом.
-        is_valid = bool(totp.verify(normalized_code, valid_window=1))
-    except Exception:
-        # Любая ошибка в процессе проверки не должна падать наружу.
-        logger.warning("Error while verifying TOTP code", exc_info=True)
-        return False
+    if not is_valid:
+        logger.info(
+            "TOTP code verification failed: invalid code",
+            extra={"code_length": len(normalized_code)},
+        )
+    else:
+        logger.debug("TOTP code verified successfully")
 
     return is_valid
 
 
-# ---------- Внутренние вспомогательные функции ----------
-
-
-def _get_totp(secret: str) -> "pyotp.TOTP":
+def _get_totp_instance(secret: str):
     """
-    Получить экземпляр TOTP для заданного секрета.
+    Внутренний helper: получить экземпляр pyotp.TOTP по секрету.
 
-    Вынесено в отдельную функцию для единообразной обработки ошибок.
+    Вынесен отдельно, чтобы при необходимости можно было мокать его в тестах.
     """
-    if pyotp is None:
-        # Защита от несогласованного состояния; в публичных функциях мы уже проверяем pyotp.
-        raise RuntimeError(
-            "pyotp is required for TOTP operations but is not installed"
-        )
-
+    _ensure_pyotp_available()
     # type: ignore[name-defined] — pyotp подгружается динамически.
     return pyotp.TOTP(secret)  # type: ignore[no-any-return]
 
