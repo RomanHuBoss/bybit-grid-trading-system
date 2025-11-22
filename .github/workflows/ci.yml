@@ -64,7 +64,7 @@ jobs:
           --health-retries=5
     env:
       DATABASE_URL: postgresql://postgres:postgres@localhost:5432/avi5
-      TEST_DB_DSN: postgresql://postgres:postgres@localhost:5432/avi5_test
+      TEST_DB_DSN: postgresql://postgres:postgres@localhost:5432/avi5
       REDIS_URL: redis://localhost:6379/0
 
     steps:
