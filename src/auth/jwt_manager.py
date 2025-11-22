@@ -8,13 +8,19 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Optional, Tuple
 from uuid import UUID, uuid4
 
-import jwt  # type: ignore[import-untyped]
-from jwt import (  # type: ignore[import-untyped]
-    ExpiredSignatureError as PyJWTExpiredSignatureError,
-    InvalidTokenError as PyJWTInvalidTokenError,
-    decode as jwt_decode,
-    encode as jwt_encode,
-)
+try:
+    import jwt  # type: ignore[import-untyped]
+    from jwt import (  # type: ignore[import-untyped]
+        ExpiredSignatureError as PyJWTExpiredSignatureError,
+        InvalidTokenError as PyJWTInvalidTokenError,
+    )
+except Exception as exc:  # noqa: BLE001
+    # Здесь явно падаем, если вместо PyJWT установлен другой пакет "jwt"
+    raise RuntimeError(
+        "JWTAuthManager requires the PyJWT library. "
+        "Make sure you have 'PyJWT' installed (e.g. 'pip install PyJWT') "
+        "and do NOT install the unrelated 'jwt' package."
+    ) from exc
 
 from src.core.config_loader import ConfigLoader
 
@@ -198,6 +204,15 @@ class JWTAuthManager:
         self._is_jti_blacklisted = is_jti_blacklisted
         self._logger = logger.getChild(self.__class__.__name__)
 
+        # Дополнительный рантайм-проверочный хук на случай, если PyJWT не тот:
+        for attr in ("encode", "decode"):
+            if not hasattr(jwt, attr):
+                raise RuntimeError(
+                    f"Installed 'jwt' module does not provide '{attr}'. "
+                    "Most likely the wrong package 'jwt' is installed. "
+                    "Uninstall 'jwt' and install 'PyJWT' instead."
+                )
+
     # ---------- Публичный API ----------
 
     def issue_token_pair(
@@ -294,7 +309,7 @@ class JWTAuthManager:
         :raises InvalidTokenError: при любом нарушении формата/подписи.
         """
         try:
-            payload = jwt_decode(
+            payload = jwt.decode(
                 token,
                 key=self._settings.secret,
                 algorithms=[self._settings.algorithm],
@@ -398,7 +413,7 @@ class JWTAuthManager:
                     )
                 base_claims[key] = value
 
-        token = jwt_encode(
+        token = jwt.encode(
             base_claims,
             key=self._settings.secret,
             algorithm=self._settings.algorithm,
