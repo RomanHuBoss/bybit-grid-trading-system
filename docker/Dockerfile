@@ -32,14 +32,13 @@ RUN pip install --no-cache-dir --user -r requirements.txt
 # --------
 # Runtime stage: минимальный образ с зависимостями и кодом
 # --------
-FROM python:3.11-slim AS runtime
+FROM python:3.12-slim AS runtime
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     # бинарники из user site (если вдруг появятся – тот же путь, что в builder'е)
-    PATH="/root/.local/bin:${PATH}" \
-    # явно добавляем site-packages из builder'а, чтобы они были доступны
-    PYTHONPATH="/root/.local/lib/python3.11/site-packages:${PYTHONPATH}"
+    PATH="/root/.local/bin:${PATH}"
+# user site-packages из /root/.local будут автоматически доступны Python
 
 # Создаём рабочий каталог
 WORKDIR /app
