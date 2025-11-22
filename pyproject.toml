@@ -9,6 +9,7 @@ packages = [{ include = "src" }]
 
 [tool.poetry.dependencies]
 python = "^3.12"
+pydantic-settings = "^2.0"
 
 # Основной стек backend'a
 fastapi = "*"
