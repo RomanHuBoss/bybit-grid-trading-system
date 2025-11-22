@@ -10,10 +10,11 @@ from uuid import UUID, uuid4
 
 try:
     import jwt  # type: ignore[import]
-    from jwt import ExpiredSignatureError, InvalidTokenError  # type: ignore[import]
+    from jwt import ExpiredSignatureError as PyJWTExpiredSignatureError, InvalidTokenError as PyJWTInvalidTokenError  # type: ignore[import]
 except ImportError:  # pragma: no cover - библиотека может отсутствовать в окружении выполнения
     jwt = None  # type: ignore[assignment]
-    ExpiredSignatureError = InvalidTokenError = None  # type: ignore[assignment]
+    PyJWTExpiredSignatureError = PyJWTInvalidTokenError = None  # type: ignore[assignment]
+
 
 from src.core.config_loader import ConfigLoader
 
@@ -176,13 +177,14 @@ def _load_jwt_settings() -> JWTSettings:
             "Set auth.jwt.secret in settings.yaml or define JWT_SECRET environment variable."
         )
 
-    _JWT_SETTINGS = JWTSettings(
+    settings = JWTSettings(
         secret=secret,
         algorithm=algorithm,
         access_ttl_seconds=access_ttl_seconds,
         refresh_ttl_seconds=refresh_ttl_seconds,
     )
-    return _JWT_SETTINGS
+    _JWT_SETTINGS = settings
+    return settings
 
 
 class JWTAuthManager:
@@ -202,16 +204,19 @@ class JWTAuthManager:
         *,
         is_jti_blacklisted: Optional[Callable[[str], bool]] = None,
     ) -> None:
-        _require_jwt_lib()
-
+        """
+        :param settings: Настройки JWT. Если None — будут загружены через _load_jwt_settings().
+        :param is_jti_blacklisted: Callback для проверки, отозван ли токен по jti.
+        """
         self._settings = settings or _load_jwt_settings()
         self._is_jti_blacklisted = is_jti_blacklisted
-        self._logger = logger
+        self._logger = logger.getChild(self.__class__.__name__)
 
     # ---------- Публичный API ----------
 
     def issue_token_pair(
         self,
+        *,
         user_id: UUID,
         role: str,
         extra_claims: Optional[Dict[str, Any]] = None,
@@ -219,9 +224,9 @@ class JWTAuthManager:
         """
         Сгенерировать пару (access, refresh) токенов для пользователя.
 
-        :param user_id: Идентификатор пользователя (UUID).
-        :param role: Роль пользователя.
-        :param extra_claims: Дополнительные кастомные клаймы.
+        :param user_id: UUID пользователя.
+        :param role: Роль пользователя (viewer/trader/admin).
+        :param extra_claims: Дополнительные клаймы, которые нужно включить в оба токена.
         :return: (access_token, refresh_token).
         """
         jti_access = str(uuid4())
@@ -275,20 +280,17 @@ class JWTAuthManager:
 
         role = str(payload.get("role", "") or "")
         if not role:
-            raise InvalidTokenError("Refresh token payload does not contain 'role' claim")
+            raise InvalidTokenError("Refresh token payload does not contain 'role'")
 
-        access, new_refresh = self.issue_token_pair(user_id=user_id, role=role)
+        # Дополнительные клаймы сохраняем при рефреше, кроме технических:
+        # sub, role, type, iat, exp, jti.
+        extra_claims: Dict[str, Any] = {}
+        for key, value in payload.items():
+            if key in {"sub", "role", "type", "iat", "exp", "jti"}:
+                continue
+            extra_claims[key] = value
 
-        self._logger.info(
-            "JWT token pair refreshed",
-            extra={
-                "user_id": str(user_id),
-                "role": role,
-                "old_refresh_jti": payload.get("jti"),
-            },
-        )
-
-        return access, new_refresh
+        return self.issue_token_pair(user_id=user_id, role=role, extra_claims=extra_claims)
 
     def decode_token(
         self,
@@ -314,10 +316,10 @@ class JWTAuthManager:
                 algorithms=[self._settings.algorithm],
                 options={"verify_exp": verify_exp},
             )
-        except ExpiredSignatureError as exc:  # type: ignore[misc]
+        except PyJWTExpiredSignatureError as exc:  # type: ignore[misc]
             self._logger.info("JWT token expired", extra={"reason": "expired"})
             raise ExpiredTokenError("JWT token has expired") from exc
-        except InvalidTokenError as exc:  # type: ignore[misc]
+        except PyJWTInvalidTokenError as exc:  # type: ignore[misc]
             self._logger.info("JWT token invalid", extra={"reason": "invalid"})
             raise InvalidTokenError("JWT token is invalid") from exc
         except Exception as exc:  # noqa: BLE001
@@ -391,7 +393,7 @@ class JWTAuthManager:
         elif token_type == "refresh":
             ttl = self._settings.refresh_ttl_seconds
         else:
-            raise ValueError(f"Unsupported JWT token_type: {token_type!r}")
+            raise ValueError(f"Unsupported token_type: {token_type!r}")
 
         base_claims: Dict[str, Any] = {
             "sub": str(subject),
