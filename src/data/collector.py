@@ -235,7 +235,7 @@ class DataCollector:
 
         if kind == "orderbook":
             depth = parts[1] if len(parts) > 1 else "10"
-            return f"ob:L10" if depth == "10" else f"ob:L{depth}"
+            return "ob:L10" if depth == "10" else f"ob:L{depth}"
 
         # Фоллбэк для неизвестных каналов.
         return channel.replace(".", ":")
