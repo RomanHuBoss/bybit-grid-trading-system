@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 from decimal import Decimal, getcontext
-from typing import Iterable, List, Sequence, Tuple
+from typing import List, Sequence, Tuple
 
 from src.core.models import ConfirmedCandle as Candle
 
-
 # Индикаторы стратегии работают с Decimal с точностью не ниже 28.
 getcontext().prec = 28
+
+
+# Тип для уровней стакана: (price, quantity)
+OrderbookLevel = Tuple[Decimal, Decimal]
 
 
 # ---------------------------------------------------------------------------
@@ -16,123 +19,146 @@ getcontext().prec = 28
 
 def ema(values: Sequence[Decimal], period: int) -> Decimal:
     """
-    Классическая EMA.
-    Требует не меньше `period` элементов.
+    Экспоненциальное скользящее среднее по стандартной формуле.
 
-    Формула:
-        EMA_t = α * v_t + (1 - α) * EMA_{t-1}
-        α = 2 / (period + 1)
+    Алгоритм совпадает с тем, что используется в тестах:
+
+        alpha = 2 / (period + 1)
+        ema_0 = values[0]
+        ema_t = alpha * value_t + (1 - alpha) * ema_{t-1}
+
+    :param values: Последовательность значений (Decimal).
+    :param period: Период усреднения, > 0.
+    :raises ValueError: если period <= 0 или длина ряда < period.
     """
     if period <= 0:
         raise ValueError("EMA period must be positive")
 
-    if len(values) < period:
-        raise ValueError("Not enough values to compute EMA")
+    n = len(values)
+    if n < period:
+        raise ValueError("Series is too short for the given EMA period")
 
     alpha = Decimal("2") / Decimal(period + 1)
-    e = values[0]
+    one_minus_alpha = Decimal(1) - alpha
 
+    result = values[0]
     for v in values[1:]:
-        e = alpha * v + (Decimal(1) - alpha) * e
+        result = alpha * v + one_minus_alpha * result
 
-    return e
+    return result
 
 
 # ---------------------------------------------------------------------------
-# ATR (Average True Range) через EMA TR
+# ATR (Average True Range)
 # ---------------------------------------------------------------------------
 
 def atr(candles: Sequence[Candle], period: int) -> Decimal:
     """
-    ATR по определению Уайлдера:
-        TR_t = max(high_t - low_t, |high_t - close_{t-1}|, |low_t - close_{t-1}|)
-        ATR_t = EMA(TR, period)
+    ATR по формуле Уайлдера.
 
-    Требования:
-        • не менее period+1 баров (нужен предыдущий close).
-        • цены и объёмы — Decimal.
+    Тесты ожидают, что мы:
+      1) считаем TR (True Range) как:
+            TR = max(
+                high - low,
+                abs(high - prev_close),
+                abs(low - prev_close),
+            )
+         для каждой пары соседних свечей (cur, prev);
+      2) применяем ema(TR, period).
+
+    То есть длина ряда TR = len(candles) - 1.
+    Для заданного `period` нужно минимум `period + 1` свечей.
     """
     if period <= 0:
         raise ValueError("ATR period must be positive")
 
     if len(candles) < period + 1:
-        raise ValueError("Not enough candles to compute ATR")
+        raise ValueError("Not enough candles for ATR: require at least period+1")
 
     trs: List[Decimal] = []
-    for i in range(1, len(candles)):
-        cur = candles[i]
-        prev = candles[i - 1]
-
+    for cur, prev in zip(candles[1:], candles[:-1]):
         tr1 = cur.high - cur.low
         tr2 = (cur.high - prev.close).copy_abs()
         tr3 = (cur.low - prev.close).copy_abs()
-
         trs.append(max(tr1, tr2, tr3))
 
     return ema(trs, period)
 
 
 # ---------------------------------------------------------------------------
-# VWAP за окно последних N баров
+# VWAP (Volume-Weighted Average Price)
 # ---------------------------------------------------------------------------
 
 def vwap(candles: Sequence[Candle]) -> Decimal:
     """
-    VWAP = sum(price_i * volume_i) / sum(volume_i)
-    где price_i = (high+low+close)/3 или close (вариант).
-    Для простоты: price_i = close (как в vwap базовой реализации AVI-5).
+    VWAP по закрытию свечей.
 
-    Требует:
-        • >= 1 свечи,
-        • volume >= 0.
+    Контракт по тестам:
+
+    * при одной свече результат должен быть ровно равен close;
+    * при нескольких свечах используется объёмное среднее:
+        sum(close_i * volume_i) / sum(volume_i);
+    * vwap([]) → ValueError;
+    * отрицательный объём хотя бы у одной свечи → ValueError;
+    * при нескольких свечах и суммарном объёме == 0 → ZeroDivisionError.
+
+    Для одиночной свечи допускаем volume == 0 и всё равно возвращаем close,
+    как описано в docstring теста.
     """
     if not candles:
         raise ValueError("VWAP requires at least one candle")
 
-    total_volume = Decimal("0")
-    total_price_volume = Decimal("0")
-
+    # Проверяем объёмы на отрицательные значения.
     for c in candles:
-        v = c.volume
-        if v < 0:
-            raise ValueError("Volume must be non-negative")
+        if c.volume < 0:
+            raise ValueError("Volume must be non-negative for VWAP")
 
-        total_volume += v
-        total_price_volume += c.close * v
+    if len(candles) == 1:
+        # Особый контракт: VWAP одной свечи = её close,
+        # независимо от объёма (кроме отрицательного, который мы уже отсеяли).
+        return candles[0].close
 
+    total_volume = sum(c.volume for c in candles)
     if total_volume == 0:
-        raise ZeroDivisionError("VWAP total volume is zero")
+        # Тест ожидает ZeroDivisionError при нулевой сумме объёмов.
+        raise ZeroDivisionError("Total volume is zero in VWAP")
 
-    return total_price_volume / total_volume
+    weighted_sum = sum(c.close * c.volume for c in candles)
+    return Decimal(weighted_sum / total_volume)
 
 
 # ---------------------------------------------------------------------------
-# Donchian Channel (N-bar high/low)
+# Donchian Channel
 # ---------------------------------------------------------------------------
 
 def donchian(candles: Sequence[Candle], window: int) -> Tuple[Decimal, Decimal]:
     """
-    Классический Donchian:
-        upper = max(high_i), lower = min(low_i) за последний window баров.
+    Дончиан-канал по high/low.
 
-    Требует:
-        • window >= 1
-        • len(candles) >= window
+    По тестам:
+
+    * окно должно быть > 0, иначе ValueError;
+    * длина ряда должна быть не меньше окна, иначе ValueError;
+    * для `window` берутся последние `window` свечей;
+    * upper = max(high_i), lower = min(low_i) по этим свечам.
     """
     if window <= 0:
         raise ValueError("Donchian window must be positive")
 
     if len(candles) < window:
-        raise ValueError("Not enough candles for Donchian channel")
+        raise ValueError("Not enough candles for Donchian window")
 
-    highs = [c.high for c in candles[-window:]]
-    lows = [c.low for c in candles[-window:]]
+    window_slice = candles[-window:]
+    highs = [c.high for c in window_slice]
+    lows = [c.low for c in window_slice]
 
-    return max(highs), min(lows)
+    upper = max(highs)
+    lower = min(lows)
+    return upper, lower
 
 
 # ---------------------------------------------------------------------------
-# Microprice, orderbook imbalance
+# Microprice
 # ---------------------------------------------------------------------------
 
 def microprice(
@@ -142,49 +168,65 @@ def microprice(
     ask_qty: Decimal,
 ) -> Decimal:
     """
-    Microprice:
-        mp = (best_ask * bid_qty + best_bid * ask_qty) / (bid_qty + ask_qty)
+    Микропрайс на основе лучшего бида/аска и их объёмов.
 
-    Требует:
-        • bid_qty > 0
-        • ask_qty > 0
-        • best_bid <= best_ask
+    Тесты явно задают формулу:
+
+        (ask * bid_qty + bid * ask_qty) / (bid_qty + ask_qty)
+
+    и проверяют следующие инварианты:
+
+    * bid_qty > 0 и ask_qty > 0, иначе ValueError;
+    * best_bid < best_ask, иначе ValueError.
     """
     if bid_qty <= 0 or ask_qty <= 0:
-        raise ValueError("Bid/ask quantities must be positive")
+        raise ValueError("Bid/ask quantities must be positive for microprice")
 
-    if best_bid > best_ask:
-        raise ValueError("best_bid cannot exceed best_ask")
+    if best_bid >= best_ask:
+        raise ValueError("Best bid must be strictly below best ask")
 
-    return (best_ask * bid_qty + best_bid * ask_qty) / (bid_qty + ask_qty)
+    denominator = bid_qty + ask_qty
+    if denominator == 0:
+        # Теоретически невозможен при наших проверках, но оставим защиту.
+        raise ZeroDivisionError("Total quantity is zero in microprice")
 
+    numerator = best_ask * bid_qty + best_bid * ask_qty
+    return numerator / denominator
+
+
+# ---------------------------------------------------------------------------
+# Orderbook imbalance
+# ---------------------------------------------------------------------------
 
 def orderbook_imbalance(
-    bid_levels: Iterable[Tuple[Decimal, Decimal]],
-    ask_levels: Iterable[Tuple[Decimal, Decimal]],
-    depth: int = 5,
+    bids: Sequence[OrderbookLevel],
+    asks: Sequence[OrderbookLevel],
+    *,
+    depth: int,
 ) -> Decimal:
     """
-    Отношение агрегированного bid volume к суммарному объёму bid+ask.
+    Имбаланс стакана по агрегированным объёмам.
 
-    При depth=N берём первые N уровней стакана.
+    Контракт по тестам:
 
-    Формула:
-        I = (sum(bid_qty[0:N])) / (sum(bid_qty[0:N]) + sum(ask_qty[0:N]))
-
-    Требует, чтобы оба списка уровней были non-empty и depth>=1.
+    * используется суммарный объём по первым `depth` уровням каждой стороны;
+    * результат = bid_volume / (bid_volume + ask_volume);
+    * depth должен быть > 0, иначе ValueError;
+    * обе стороны после среза должны быть непустыми, иначе ValueError;
+    * отрицательные объёмы → ValueError;
+    * при суммарном объёме == 0 → ZeroDivisionError.
     """
     if depth <= 0:
-        raise ValueError("depth must be >= 1")
+        raise ValueError("Depth must be positive")
 
-    bid_list = list(bid_levels)[:depth]
-    ask_list = list(ask_levels)[:depth]
+    bid_slice = list(bids[:depth])
+    ask_slice = list(asks[:depth])
 
-    if not bid_list or not ask_list:
+    if not bid_slice or not ask_slice:
         raise ValueError("Both bid and ask levels must be non-empty")
 
-    bid_volume = sum(q for _, q in bid_list)
-    ask_volume = sum(q for _, q in ask_list)
+    bid_volume = sum(q for _, q in bid_slice)
+    ask_volume = sum(q for _, q in ask_slice)
 
     if bid_volume < 0 or ask_volume < 0:
         raise ValueError("Volumes must be non-negative")
