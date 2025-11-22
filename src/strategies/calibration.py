@@ -130,12 +130,16 @@ class CalibrationService:
                 "theta map will fallback to theta_min for all hours",
             )
             theta_map = {hour: self._params.theta_min for hour in range(24)}
+            # Не трогаем PSI baseline, чтобы не затирать его пустой выборкой.
+            logger.warning(
+                "Skipping PSI baseline update: no signals available for calibration window",
+            )
         else:
             theta_map = self._build_theta_map(signals)
 
-        # Сохраняем baseline распределения probability для PSI-мониторинга.
-        hist = self._build_probability_histogram(signals)
-        await self._save_histogram_baseline(hist)
+            # Сохраняем baseline распределения probability для PSI-мониторинга.
+            hist = self._build_probability_histogram(signals)
+            await self._save_histogram_baseline(hist)
 
         # Пишем theta_map в Redis.
         await self._save_theta_map(theta_map)
@@ -262,7 +266,9 @@ class CalibrationService:
             # Индекс квантиля: floor(q * (n-1))
             q = self._params.target_quantile
             n = len(probs_sorted)
-            idx_raw = (q * Decimal(n - 1)).to_integral_value(rounding=getcontext().rounding)
+            idx_raw = (q * Decimal(n - 1)).to_integral_value(
+                rounding=getcontext().rounding,
+            )
             idx = int(idx_raw)
             candidate = probs_sorted[idx]
 
@@ -288,10 +294,11 @@ class CalibrationService:
         :param signals: Итерация по Signal.
         :param bins: Количество бинов (по умолчанию 10 — по 0.1).
         :return: Список длины bins, суммарно дающих 1 (в Decimal).
+        :raises ValueError: если выборка пуста.
         """
         probs: List[Decimal] = [s.probability for s in signals]
         if not probs:
-            return [Decimal("0")] * bins
+            raise ValueError("Cannot build histogram from empty probability set")
 
         counts = [0] * bins
         for p in probs:
@@ -301,10 +308,11 @@ class CalibrationService:
             elif p >= 1:
                 idx = bins - 1
             else:
-                # int( p * bins ), p in [0,1) -> [0, bins-1]
-                idx = int((p * Decimal(bins)).to_integral_value(rounding=getcontext().rounding))
-                if idx == bins:  # на всякий случай
+                idx = int(p * bins)
+                if idx >= bins:
                     idx = bins - 1
+                if idx < 0:
+                    idx = 0
             counts[idx] += 1
 
         total = Decimal(len(probs))
