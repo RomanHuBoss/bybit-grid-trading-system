@@ -17,15 +17,20 @@ _SYMBOL_SUFFIXES: tuple[str, ...] = (
 
 def extract_base_symbol(symbol: str) -> str:
     """
-    Выделить базовый актив из символа инструмента.
+    Выделить базовый актив из линейного фьючерса Bybit по его тикеру.
+
+    Правила:
+      * если тикер оканчивается на один из известных суффиксов (_SYMBOL_SUFFIXES),
+        мы воспринимаем эту часть как котируемую валюту и отбрасываем её;
+      * оставшаяся часть (prefix) возвращается в верхнем регистре;
+      * если ни один суффикс не совпал, возвращаем исходный тикер в верхнем
+        регистре целиком.
 
     Примеры:
         "BTCUSDT" -> "BTC"
         "ETHUSD"  -> "ETH"
         "SOLUSDC" -> "SOL"
-
-    Если ни один из известных суффиксов не найден, возвращается символ в верхнем
-    регистре как есть.
+        "XRP"     -> "XRP"  (суффикс не найден)
     """
     if not symbol:
         return symbol
@@ -52,8 +57,8 @@ def count_open_positions_by_base(
             "ETH": {"long": 0, "short": 2},
         }
 
-    В расчёт включаются только позиции с closed_at is None.
-    Некорректные direction (не long/short) игнорируются.
+    Учитываются только действительно открытые позиции (closed_at is None).
+    Любые позиции с направлением, отличным от "long"/"short", мягко игнорируются.
     """
     result: defaultdict[str, Dict[str, int]] = defaultdict(
         lambda: {"long": 0, "short": 0},
@@ -89,21 +94,17 @@ def can_open_position_for_base(
     Проверить, можно ли открыть ещё одну позицию по базовому активу.
 
     Правила (соответствуют per-base лимиту из спецификации):
-      * по базовому активу допустимо не более max_positions_per_base открытых позиций;
-      * по каждому направлению (long/short) допускается максимум одна открытая позиция:
-        - нельзя иметь две long по BTC (long + long),
-        - нельзя иметь две short по BTC (short + short),
-        - комбинация long + short по тому же базовому активу разрешена.
+      * по базовому активу допустимо не более ``max_positions_per_base`` открытых
+        позиций суммарно (long + short);
+      * по одному направлению (long/short) в базовом активе допускается не более
+        одной открытой позиции;
+      * некорректные значения ``direction`` приводят к безопасному отказу
+        (функция возвращает False).
 
-    :param positions: Текущий список позиций (как минимум открытых,
-                      закрытые будут отфильтрованы).
-    :param symbol: Символ инструмента для новой позиции (например, "BTCUSDT").
-    :param direction: Направление новой позиции ("long" или "short").
-    :param max_positions_per_base: Лимит количества открытых позиций по базовому активу.
-
-    :return: True, если позицию можно открывать, иначе False.
+    Функция не занимается проверкой общих аккаунтных лимитов
+    (max_concurrent, max_total_risk_r и т.п.) — только per-base ограничениями.
     """
-    if max_positions_per_base < 1:
+    if max_positions_per_base <= 0:
         # Конфигурация с нулевым лимитом не имеет смысла — безопаснее запретить вход.
         return False
 
@@ -118,7 +119,9 @@ def can_open_position_for_base(
     counts_for_base = base_counts.get(base, {"long": 0, "short": 0})
 
     # 1) Проверка общего количества позиций по базовому активу
-    total_open_for_base = counts_for_base.get("long", 0) + counts_for_base.get("short", 0)
+    total_open_for_base = (
+        counts_for_base.get("long", 0) + counts_for_base.get("short", 0)
+    )
     if total_open_for_base >= max_positions_per_base:
         return False
 
