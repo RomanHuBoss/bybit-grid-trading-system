@@ -67,7 +67,6 @@ def generate_totp_secret(config: Optional[TOTPConfig] = None) -> str:
     cfg = config or TOTPConfig()
 
     length = max(16, int(cfg.secret_length))  # минимальная разумная длина
-    # type: ignore[name-defined] — pyotp подгружается динамически.
     secret = pyotp.random_base32(length=length)  # type: ignore[no-any-return]
 
     logger.debug("Generated new TOTP secret", extra={"secret_length": length})
@@ -100,7 +99,6 @@ def build_provisioning_uri(
 
     # В соответствии со стандартной схемой: otpauth://totp/<issuer>:<label>?secret=...&issuer=...
     # pyotp сам корректно сформирует URI с нужными параметрами.
-    # type: ignore[name-defined]
     totp = pyotp.TOTP(secret)  # type: ignore[no-any-return]
     uri = totp.provisioning_uri(
         name=normalized_label,
@@ -145,7 +143,6 @@ def verify_totp_code(
         )
         return False
 
-    # type: ignore[name-defined]
     totp = pyotp.TOTP(secret)  # type: ignore[no-any-return]
     # valid_window — это количество дополнительных интервалов вокруг текущего,
     # которые считаются допустимыми (для компенсации рассинхрона часов).
@@ -174,7 +171,6 @@ def _get_totp_instance(secret: str):
     Вынесен отдельно, чтобы при необходимости можно было мокать его в тестах.
     """
     _ensure_pyotp_available()
-    # type: ignore[name-defined] — pyotp подгружается динамически.
     return pyotp.TOTP(secret)  # type: ignore[no-any-return]
 
 
