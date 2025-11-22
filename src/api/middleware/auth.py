@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional, Set
+from typing import Awaitable, Callable, FrozenSet, Optional
 
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
@@ -15,6 +15,12 @@ class AuthConfig:
     """
     Конфигурация простой API-key аутентификации на уровне middleware.
 
+    Этот слой не является основной системой аутентификации (JWT + RBAC),
+    описанной в документации (auth-эндпоинты и роли пользователей).
+    Он предназначен для дополнительной защиты отдельных внутренних /
+    служебных эндпоинтов, когда это требуется инфраструктурой
+    (например, internal-tools, cron, сервисные вызовы).
+
     enabled:
         Включена ли проверка вообще. Если False — middleware прозрачен.
     header_name:
@@ -25,7 +31,7 @@ class AuthConfig:
 
     enabled: bool = True
     header_name: str = "X-API-Key"
-    valid_keys: Set[str] = frozenset()  # type: ignore[assignment]
+    valid_keys: FrozenSet[str] = frozenset()
 
 
 class APIKeyAuthMiddleware(BaseHTTPMiddleware):
@@ -39,14 +45,26 @@ class APIKeyAuthMiddleware(BaseHTTPMiddleware):
     - при успешной проверке сохраняем key в request.state.api_key и пропускаем запрос.
 
     Это middleware не знает про пользователей/роли и не лезет в базу;
-    оно обеспечивает только "тонкий" слой защиты для внутренних/админских эндпоинтов.
+    оно обеспечивает только "тонкий" слой защиты для внутренних/админских эндпоинтов
+    и не заменяет JWT-аутентификацию и RBAC.
     """
 
     def __init__(self, app, config: Optional[AuthConfig] = None) -> None:  # type: ignore[override]
         super().__init__(app)
         self._config = config or AuthConfig()
 
-    async def dispatch(self, request: Request, call_next) -> Response:
+    async def dispatch(
+        self,
+        request: Request,
+        call_next: Callable[[Request], Awaitable[Response]],
+    ) -> Response:
+        """
+        Выполнить проверку API-ключа и передать управление следующему обработчику.
+
+        Проверка выполняется только если:
+        - включён флаг enabled,
+        - и в конфигурации есть хотя бы один допустимый ключ.
+        """
         cfg = self._config
 
         # Если аутентификация отключена или нет ни одного валидного ключа —
