@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import time
 from dataclasses import dataclass
-from typing import Optional
+from typing import Any, Awaitable, Optional
 from uuid import uuid4
 
 from redis.asyncio import Redis
@@ -187,12 +187,17 @@ class RedisDistributedLock:
             return
 
         try:
-            res = await self._redis.eval(
+            # Тип Redis.eval в redis-py описан единым образом для sync/async API,
+            # поэтому mypy видит здесь union вроде "Awaitable[Any] | str".
+            # В нашем контексте eval всегда возвращает awaitable, поэтому
+            # явно приводим тип к Awaitable[Any] перед await.
+            eval_call: Awaitable[Any] = self._redis.eval(  # type: ignore[assignment]
                 _RELEASE_SCRIPT,
                 1,  # numkeys
                 self._key,  # KEYS[1]
                 self._value,  # ARGV[1]
             )
+            res = await eval_call
 
             logger.debug(
                 "Distributed lock released",
