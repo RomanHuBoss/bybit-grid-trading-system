@@ -3,14 +3,13 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Any, Dict, Optional
 from uuid import UUID, uuid4
 
 from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
-    FieldValidationInfo,
     field_validator,
     model_validator,
 )
@@ -116,11 +115,11 @@ class DBConfig(BaseModel):
     pool_max_size: int = Field(10, ge=1)
 
     @field_validator("pool_max_size")
-    def _check_pool_sizes(cls, max_size: int, info: FieldValidationInfo) -> int:
+    def _check_pool_sizes(cls, max_size: int, info: Any) -> int:
         """
         Гарантирует, что максимальный размер пула не меньше минимального.
         """
-        min_size = info.data.get("pool_min_size", 1)
+        min_size = info.data.get("pool_min_size", 1) if hasattr(info, "data") else 1
         if isinstance(min_size, int) and max_size < min_size:
             raise ValueError("pool_max_size must be >= pool_min_size")
         return max_size
