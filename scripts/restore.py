@@ -87,7 +87,16 @@ def run_pg_restore(dsn: str, backup_path: Path) -> None:
         dsn,
         str(dump_path),
     ]
-    logger.info("Команда: %s", " ".join(cmd))
+    # Не логируем DSN целиком, чтобы не унести пароль/секреты в логи.
+    safe_cmd = list(cmd)
+    try:
+        idx = safe_cmd.index("--dbname") + 1
+        safe_cmd[idx] = "<DSN hidden>"
+    except (ValueError, IndexError):
+        # Если по какой-то причине структура команды изменилась,
+        # логируем как есть (но без отдельной подстановки пароля).
+        pass
+    logger.info("Команда: %s", " ".join(safe_cmd))
     subprocess.run(cmd, check=True)
 
 
@@ -140,7 +149,7 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         "--dsn",
         required=False,
         help="DSN для подключения к целевой БД. "
-             "Если не задан, используется DATABASE_URL или PG* переменные.",
+             "Если не задан, используется DATABASE_URL, DB_DSN или PG* переменные.",
     )
     parser.add_argument(
         "--work-dir",
@@ -153,7 +162,7 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
 
 def _resolve_dsn(cli_dsn: Optional[str]) -> str:
     """
-    Разрешает DSN по приоритету: CLI → DATABASE_URL → PG* переменные.
+    Разрешает DSN по приоритету: CLI → DATABASE_URL/DB_DSN → PG* переменные.
 
     :param cli_dsn: DSN, переданный из командной строки.
     :return: Строка подключения.
@@ -162,7 +171,7 @@ def _resolve_dsn(cli_dsn: Optional[str]) -> str:
     if cli_dsn:
         return cli_dsn
 
-    env_dsn = os.getenv("DATABASE_URL")
+    env_dsn = os.getenv("DATABASE_URL") or os.getenv("DB_DSN")
     if env_dsn:
         return env_dsn
 
