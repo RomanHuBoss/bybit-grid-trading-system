@@ -10,10 +10,10 @@ __all__ = [
     "NetworkError",
     "DatabaseError",
     "ExecutionError",
+    "InvalidCandleError",
     "ExternalAPIError",
     "WSConnectionError",
     "RateLimitExceededError",
-    "InvalidCandleError",
 ]
 
 
@@ -89,6 +89,29 @@ class ExecutionError(AppError):
     pass
 
 
+class InvalidCandleError(AppError):
+    """
+    Исключение, выбрасываемое при некорректных OHLCV-данных свечи.
+
+    Используется в местах, где входная свеча не проходит базовые
+    sanity-check-и и не может быть использована движком сигналов
+    (SignalEngine) и связанными подсистемами.
+
+    Типичные причины:
+        - нарушена базовая геометрия OHLC (high < max(open, close) или
+          low > min(open, close));
+        - цена закрытия выходит за диапазон [low, high];
+        - отрицательный объём;
+        - свеча помечена как ``confirmed=True``, но её ``close_time``
+          находится в будущем.
+
+    Атрибут ``details`` (dict) может содержать дополнительные данные о
+    причинах отклонения для последующей логгирования и отладки.
+    """
+
+    pass
+
+
 class ExternalAPIError(AppError):
     """
     Обёртка над бизнес-ошибками внешних API (Bybit REST/WS, Slack, webhooks).
@@ -121,26 +144,3 @@ class RateLimitExceededError(AppError):
     """
 
     pass
-
-class InvalidCandleError(ValueError):
-    """
-    Исключение, выбрасываемое при некорректных OHLCV-данных свечи.
-
-    Используется в `ConfirmedCandle` и связанных с ним местах, когда входная
-    свеча не проходит базовые sanity-check-и и не может быть использована
-    движком сигналов (SignalEngine).
-
-    Типичные причины:
-    - нарушена базовая геометрия OHLC (high < max(open, close) или
-      low > min(open, close));
-    - цена закрытия выходит за диапазон [low, high];
-    - отрицательный объём;
-    - свеча помечена как `confirmed=True`, но её `close_time` находится в будущем.
-
-    Атрибут `details` (dict) может содержать дополнительные данные о причинах
-    отклонения для последующей логгирования и отладки.
-    """
-
-    def __init__(self, message: str, *, details: Optional[dict] = None) -> None:
-        super().__init__(message)
-        self.details: dict = details or {}
