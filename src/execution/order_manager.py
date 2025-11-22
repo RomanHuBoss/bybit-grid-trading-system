@@ -54,6 +54,12 @@ class OrderManager:
         self._category = category
         self._default_leverage = default_leverage
 
+        logger.debug(
+            "OrderManager initialized",
+            category=self._category,
+            default_leverage=self._default_leverage,
+        )
+
     # ------------------------------------------------------------------ #
     # Публичный API                                                      #
     # ------------------------------------------------------------------ #
@@ -132,7 +138,7 @@ class OrderManager:
         body: dict[str, Any] = {
             "category": self._category,
             "symbol": signal.symbol,
-            "side": side,               # "Buy" / "Sell"
+            "side": side,  # "Buy" / "Sell"
             "orderType": "Market",
             "qty": str(size_base),
             "timeInForce": "IOC",
@@ -228,21 +234,25 @@ class OrderManager:
             else Decimal("1")
         )
 
-        position = Position(
-            id=uuid4(),
-            signal_id=signal.id if isinstance(signal.id, UUID) else UUID(str(signal.id)),
-            symbol=order_result.symbol,
-            direction=signal.direction,
-            entry_price=order_result.avg_price,
-            size_base=size_base,
-            size_quote=size_quote,
-            fill_ratio=fill_ratio,
-            opened_at=now,
-            closed_at=None,
+        # Используем dict[str, Any] → **kwargs, как и в PositionRepository,
+        # чтобы не конфликтовать с строгой сигнатурой Position.__init__ в mypy.
+        position_data: dict[str, Any] = {
+            "id": uuid4(),
+            "signal_id": signal.id if isinstance(signal.id, UUID) else UUID(str(signal.id)),
+            "symbol": order_result.symbol,
+            "direction": signal.direction,
+            "entry_price": order_result.avg_price,
+            "size_base": size_base,
+            "size_quote": size_quote,
+            "fill_ratio": fill_ratio,
+            "opened_at": now,
+            "closed_at": None,
             # поля, которые присутствуют в модели, но ещё не накоплены
-            funding=Decimal("0"),
-            slippage=Decimal("0"),
-        )
+            "funding": Decimal("0"),
+            "slippage": Decimal("0"),
+        }
+
+        position = Position(**position_data)
 
         try:
             saved = await self._positions.create(position)
