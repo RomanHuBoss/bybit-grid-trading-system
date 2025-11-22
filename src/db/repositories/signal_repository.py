@@ -27,29 +27,31 @@ class SignalRepository:
       * читать последние сигналы (для UI / калибрации / аналитики);
       * обновлять error_code / error_message после обработки сигнала.
 
-    Контракт по схеме БД:
-
-      - в таблице используется колонка `side`, а в модели — поле `direction`;
-      - TP/SL хранятся как `tp1_price`, `tp2_price`, `tp3_price`, `sl_price`,
-        а в модели называются `tp1`, `tp2`, `tp3`, `stop_loss`.
-      - репозиторий берёт на себя маппинг имён колонок ↔ полям модели.
+    Контракт по схеме БД (упрощённо, по модели Signal):
+      * id: UUID (PK)
+      * created_at: TIMESTAMPTZ
+      * symbol: TEXT
+      * direction: TEXT ('long' / 'short')
+      * entry_price: NUMERIC
+      * stake_usd: NUMERIC
+      * probability: NUMERIC
+      * strategy_version: TEXT
+      * queued_until: TIMESTAMPTZ NULL
+      * tp1/tp2/tp3: NUMERIC NULL
+      * stop_loss: NUMERIC NULL
+      * error_code: INT NULL
+      * error_message: TEXT NULL
     """
 
-    # ---------- Внутренние помощники ----------
+    def __init__(self) -> None:
+        # Репозиторий опирается на глобальный пул соединений из src.db.connection.
+        self._pool: Optional[asyncpg.Pool] = None
 
-    @staticmethod
-    def _get_pool() -> asyncpg.pool.Pool:
-        """
-        Получить пул соединений, оборачивая ошибку инициализации в DatabaseError.
-        """
-        try:
-            return get_pool()
-        except RuntimeError as exc:  # пул не инициализирован / закрыт
-            logger.error("PostgreSQL pool is not available", error=str(exc))
-            raise DatabaseError(
-                "PostgreSQL pool is not available",
-                details={"error": str(exc)},
-            ) from exc
+    def _get_pool(self) -> asyncpg.Pool:
+        pool = get_pool()
+        if pool is None:
+            raise RuntimeError("Database pool is not initialized")
+        return pool
 
     @staticmethod
     def _record_to_signal(record: asyncpg.Record) -> Signal:
@@ -60,11 +62,16 @@ class SignalRepository:
         """
         data = dict(record)
 
-        # side -> direction
+        # На всякий случай нормализуем типы UUID.
+        if "id" in data and not isinstance(data["id"], UUID):
+            data["id"] = UUID(str(data["id"]))
+
+        # side -> direction (на случай, если в БД/старом API поле называлось side).
         if "side" in data and "direction" not in data:
             data["direction"] = data.pop("side")
 
-        # tp*_price / sl_price -> tp*, stop_loss
+        # При несовпадении имён колонок и модели (например, tp1_price → tp1),
+        # здесь можно сделать дополнительный маппинг.
         mapping = {
             "tp1_price": "tp1",
             "tp2_price": "tp2",
@@ -77,22 +84,18 @@ class SignalRepository:
 
         try:
             return Signal(**data)
-        except ValidationError as exc:
-            # Если данные в БД не соответствуют контракту модели — это ошибка целостности.
+        except ValidationError as exc:  # pragma: no cover — защитный слой
             raise DatabaseError(
-                "Failed to hydrate Signal from database record",
-                details={"errors": exc.errors(), "raw": data},
+                "Failed to validate Signal from database record",
+                details={"record": repr(record), "error": str(exc)},
             ) from exc
-
-    # ---------- Публичный API ----------
 
     async def create(self, signal: Signal) -> Signal:
         """
-        Сохранить новый сигнал в БД.
+        Сохранить новый сигнал в БД и вернуть его фактическое состояние.
 
         :param signal: Доменная модель сигнала.
-        :return: Сохранённый сигнал (по данным из БД).
-        :raises DatabaseError: при ошибках уровня БД.
+        :return: Сохранённая модель сигнала (включая id/created_at и т.п.).
         """
         pool = self._get_pool()
 
@@ -101,43 +104,36 @@ class SignalRepository:
                 id,
                 created_at,
                 symbol,
-                side,
+                direction,
                 entry_price,
                 stake_usd,
                 probability,
-                strategy,
                 strategy_version,
                 queued_until,
-                tp1_price,
-                tp2_price,
-                tp3_price,
-                sl_price,
+                tp1,
+                tp2,
+                tp3,
+                stop_loss,
                 error_code,
                 error_message
             )
             VALUES (
-                $1, $2, $3, $4, $5, $6, $7, $8,
-                $9, $10, $11, $12, $13, $14, $15, $16
+                $1, $2, $3, $4, $5,
+                $6, $7, $8, $9,
+                $10, $11, $12,
+                $13, $14, $15
             )
             RETURNING *
         """
-
-        logger.info(
-            "Inserting new signal into DB",
-            signal_id=str(signal.id),
-            symbol=signal.symbol,
-            direction=signal.direction,
-        )
 
         values = (
             signal.id,
             signal.created_at,
             signal.symbol,
-            signal.direction,  # маппится в колонку side
+            signal.direction,
             signal.entry_price,
             signal.stake_usd,
             signal.probability,
-            signal.strategy,
             signal.strategy_version,
             signal.queued_until,
             signal.tp1,
@@ -148,28 +144,35 @@ class SignalRepository:
             signal.error_message,
         )
 
+        logger.debug(
+            "Inserting new signal",
+            extra={
+                "signal_id": str(signal.id),
+                "symbol": signal.symbol,
+                "direction": signal.direction,
+            },
+        )
+
         try:
             async with pool.acquire() as conn:
                 record = await conn.fetchrow(query, *values)
         except asyncpg.PostgresError as exc:
             logger.exception(
-                "Failed to insert signal into DB",
-                signal_id=str(signal.id),
-                symbol=signal.symbol,
-            )
-            raise DatabaseError(
-                "Failed to insert signal into DB",
-                details={
+                "Failed to insert signal",
+                extra={
                     "signal_id": str(signal.id),
                     "symbol": signal.symbol,
-                    "error": str(exc),
                 },
+            )
+            raise DatabaseError(
+                "Failed to insert signal",
+                details={"signal_id": str(signal.id), "error": str(exc)},
             ) from exc
 
         if record is None:
-            # Такое в норме не должно происходить (INSERT .. RETURNING *)
+            # По INSERT ... RETURNING мы ожидаем ровно одну запись.
             raise DatabaseError(
-                "INSERT INTO signals returned no rows",
+                "Insert signal returned no rows",
                 details={"signal_id": str(signal.id)},
             )
 
@@ -179,7 +182,9 @@ class SignalRepository:
         """
         Получить сигнал по его идентификатору.
 
-        :raises DatabaseError: если сигнал не найден или при ошибке БД.
+        :param signal_id: UUID сигнала.
+        :return: Найденный сигнал.
+        :raises DatabaseError: Если сигнал не найден или возникает ошибка БД.
         """
         pool = self._get_pool()
 
@@ -189,13 +194,14 @@ class SignalRepository:
             WHERE id = $1
         """
 
+        logger.debug("Fetching signal by id", extra={"signal_id": str(signal_id)})
+
         try:
             async with pool.acquire() as conn:
                 record = await conn.fetchrow(query, signal_id)
         except asyncpg.PostgresError as exc:
             logger.exception(
-                "Failed to fetch signal by id",
-                signal_id=str(signal_id),
+                "Failed to fetch signal by id", extra={"signal_id": str(signal_id)}
             )
             raise DatabaseError(
                 "Failed to fetch signal by id",
@@ -227,8 +233,10 @@ class SignalRepository:
         """
         pool = self._get_pool()
 
-        params = []
-        where_clauses = []
+        # Список параметров для asyncpg. Здесь могут быть строки, даты, числа,
+        # поэтому типизируем как list[object], чтобы mypy не пытался сузить до list[str].
+        params: list[object] = []
+        where_clauses: list[str] = []
         idx = 1
 
         if symbol is not None:
@@ -257,9 +265,11 @@ class SignalRepository:
 
         logger.debug(
             "Listing recent signals",
-            symbol=symbol,
-            since=since.isoformat() if since else None,
-            limit=limit,
+            extra={
+                "symbol": symbol,
+                "since": since.isoformat() if since else None,
+                "limit": limit,
+            },
         )
 
         try:
@@ -268,7 +278,11 @@ class SignalRepository:
         except asyncpg.PostgresError as exc:
             logger.exception(
                 "Failed to list recent signals",
-                symbol=symbol,
+                extra={
+                    "symbol": symbol,
+                    "since": since.isoformat() if since else None,
+                    "limit": limit,
+                },
             )
             raise DatabaseError(
                 "Failed to list recent signals",
@@ -276,11 +290,10 @@ class SignalRepository:
                     "symbol": symbol,
                     "since": since.isoformat() if since else None,
                     "limit": limit,
-                    "error": str(exc),
-                },
+                    "error": str(exc)},
             ) from exc
 
-        return [self._record_to_signal(r) for r in records]
+        return [self._record_to_signal(record) for record in records]
 
     async def update_error_fields(
         self,
@@ -290,16 +303,17 @@ class SignalRepository:
         error_message: Optional[str],
     ) -> Signal:
         """
-        Обновить поля error_code / error_message у сигнала.
+        Обновить error_code и error_message у сигнала.
 
-        Возвращает обновлённый сигнал.
+        Используется исполнением/ордер-менеджером для фиксации ошибок обработки
+        конкретного сигнала.
         """
         pool = self._get_pool()
 
         query = """
             UPDATE signals
             SET
-                error_code    = $2,
+                error_code = $2,
                 error_message = $3
             WHERE id = $1
             RETURNING *
@@ -307,17 +321,27 @@ class SignalRepository:
 
         logger.debug(
             "Updating signal error fields",
-            signal_id=str(signal_id),
-            error_code=error_code,
+            extra={
+                "signal_id": str(signal_id),
+                "error_code": error_code,
+            },
         )
 
         try:
             async with pool.acquire() as conn:
-                record = await conn.fetchrow(query, signal_id, error_code, error_message)
+                record = await conn.fetchrow(
+                    query,
+                    signal_id,
+                    error_code,
+                    error_message,
+                )
         except asyncpg.PostgresError as exc:
             logger.exception(
                 "Failed to update signal error fields",
-                signal_id=str(signal_id),
+                extra={
+                    "signal_id": str(signal_id),
+                    "error_code": error_code,
+                },
             )
             raise DatabaseError(
                 "Failed to update signal error fields",
