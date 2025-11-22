@@ -2,16 +2,16 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import inspect
 import logging
 import os
 import sys
 from typing import Any, Optional
 
-import asyncpg
+from src.db.connection import close_pool, init_pool
 from redis.asyncio import Redis
 
 from src.core.config_loader import ConfigLoader
+from src.core.models import AppConfig
 from src.strategies.calibration import CalibrationService
 from src.db.repositories.signal_repository import SignalRepository  # type: ignore[import]
 
@@ -24,109 +24,84 @@ logger = logging.getLogger("scripts.run_calibration")
 # ---------------------------------------------------------------------------
 
 
-def _resolve_db_dsn(config: Any) -> str:
+def _resolve_db_dsn(config: AppConfig) -> str:
     """
-    Попробовать достать DSN для PostgreSQL из AppConfig или окружения.
+    Получить DSN для PostgreSQL из конфига или переменных окружения.
 
-    Приоритет:
-      1) config.db.dsn / url / database_url / uri
-      2) переменная окружения DATABASE_URL
+    Приоритет источников (см. docs/deployment.md):
+      1) config.db.dsn (pydantic-модель или dict);
+      2) переменная окружения DATABASE_URL (основной контракт);
+      3) переменная окружения DB_DSN (legacy-алиас).
 
-    Если ничего не найдено — бросает RuntimeError с человекочитаемым текстом.
+    Если ничего не найдено — бросаем RuntimeError, чтобы джоба
+    не запускалась в неконсистентной конфигурации.
     """
-    db_section = getattr(config, "db", None)
+    db_section: Any = getattr(config, "db", None)
 
-    def _get_from_section(section: Any, name: str) -> Optional[str]:
-        if section is None:
-            return None
-        if isinstance(section, dict):
-            return section.get(name)
-        return getattr(section, name, None)
+    dsn: Optional[str] = None
 
-    for field in ("dsn", "url", "database_url", "uri"):
-        value = _get_from_section(db_section, field)
-        if value:
-            return str(value)
+    if db_section is not None:
+        # Поддерживаем и pydantic-модели, и dict-подобные структуры
+        if hasattr(db_section, "dsn"):
+            dsn = getattr(db_section, "dsn", None)
+        elif isinstance(db_section, dict):
+            dsn = db_section.get("dsn")  # type: ignore[assignment]
 
-    env_dsn = os.getenv("DATABASE_URL")
-    if env_dsn:
-        return env_dsn
+    if not dsn:
+        # Основной путь из документации — DATABASE_URL, DB_DSN как алиас
+        dsn = os.getenv("DATABASE_URL") or os.getenv("DB_DSN")
 
-    raise RuntimeError(
-        "Не удалось определить DSN для БД: ожидается config.db.dsn/url "
-        "или переменная окружения DATABASE_URL."
-    )
-
-
-def _resolve_redis_dsn(config: Any) -> str:
-    """
-    Попробовать достать DSN/URL для Redis из AppConfig или окружения.
-
-    Приоритет:
-      1) config.redis.dsn / url
-      2) REDIS_URL / REDIS_DSN
-      3) host/port/db из config.redis (если заданы)
-
-    Если ничего внятного не найдено — бросает RuntimeError.
-    """
-    redis_section = getattr(config, "redis", None)
-
-    def _get_from_section(section: Any, name: str) -> Optional[str]:
-        if section is None:
-            return None
-        if isinstance(section, dict):
-            return section.get(name)
-        return getattr(section, name, None)
-
-    for field in ("dsn", "url"):
-        value = _get_from_section(redis_section, field)
-        if value:
-            return str(value)
-
-    env_url = os.getenv("REDIS_URL") or os.getenv("REDIS_DSN")
-    if env_url:
-        return env_url
-
-    host = _get_from_section(redis_section, "host") or "localhost"
-    port = _get_from_section(redis_section, "port") or 6379
-    db = _get_from_section(redis_section, "db") or 0
-
-    try:
-        port_int = int(port)
-        db_int = int(db)
-    except (TypeError, ValueError):
+    if not dsn:
         raise RuntimeError(
-            "Не удалось собрать Redis DSN из config.redis.*; "
-            "задайте redis.url/redis.dsn или REDIS_URL."
-        ) from None
+            "PostgreSQL DSN is not configured. "
+            "Expected config.db.dsn or environment variable DATABASE_URL/DB_DSN."
+        )
 
-    return f"redis://{host}:{port_int}/{db_int}"
+    return str(dsn)
 
 
-def _create_signal_repository(pool: asyncpg.Pool) -> SignalRepository:
+def _resolve_redis_dsn(config: AppConfig) -> str:
     """
-    Создать экземпляр SignalRepository, не зная точной сигнатуры __init__.
+    Получить DSN/URL для Redis из конфига или переменных окружения.
 
-    Мы не ломаем чужой код и не навязываем интерфейс, поэтому:
-      - рефлексируем сигнатуру SignalRepository;
-      - если есть аргумент pool / db_pool / conn — используем его;
-      - иначе пробуем передать пул позиционно.
+    Приоритет источников (см. docs/deployment.md):
+      1) config.redis.dsn (pydantic-модель или dict, если такая секция есть);
+      2) переменная окружения REDIS_URL (основной контракт);
+      3) переменная окружения REDIS_DSN (legacy-алиас).
+
+    Если ничего не найдено — бросаем RuntimeError.
     """
-    sig = inspect.signature(SignalRepository)  # type: ignore[call-arg]
-    params = sig.parameters
+    redis_section: Any = getattr(config, "redis", None)
 
-    kwargs: dict[str, Any] = {}
-    if "pool" in params:
-        kwargs["pool"] = pool
-    elif "db_pool" in params:
-        kwargs["db_pool"] = pool
-    elif "conn" in params:
-        kwargs["conn"] = pool
+    dsn: Optional[str] = None
 
-    if kwargs:
-        return SignalRepository(**kwargs)  # type: ignore[call-arg]
+    if redis_section is not None:
+        if hasattr(redis_section, "dsn"):
+            dsn = getattr(redis_section, "dsn", None)
+        elif isinstance(redis_section, dict):
+            dsn = redis_section.get("dsn")  # type: ignore[assignment]
 
-    return SignalRepository(pool)  # type: ignore[call-arg]
+    if not dsn:
+        dsn = os.getenv("REDIS_URL") or os.getenv("REDIS_DSN")
+
+    if not dsn:
+        raise RuntimeError(
+            "Redis DSN is not configured. "
+            "Expected config.redis.dsn or environment variable REDIS_URL/REDIS_DSN."
+        )
+
+    return str(dsn)
+
+
+def _create_signal_repository() -> SignalRepository:
+    """
+    Создать экземпляр SignalRepository.
+
+    Репозиторий использует глобальный пул соединений через
+    src.db.connection.get_pool(), поэтому в рамках этой джобы ему
+    не нужно явно передавать пул.
+    """
+    return SignalRepository()
 
 
 # ---------------------------------------------------------------------------
@@ -140,14 +115,22 @@ async def _run_calibration(symbol: Optional[str], force: bool) -> None:
 
     Поведение:
       1) Загружаем AppConfig через ConfigLoader.
-      2) Поднимаем пул PostgreSQL и Redis-клиент.
+      2) Инициализируем глобальный пул PostgreSQL через init_pool(...) и
+         создаём Redis-клиент.
       3) Собираем CalibrationService.
       4) Если не указан --force:
            - пробуем посчитать PSI-дрифт;
            - если baseline есть и дрифт в норме — калибровку пропускаем.
       5) Иначе (или при проблемах с PSI) запускаем calibrate() и логируем карту theta(h).
     """
-    loader = ConfigLoader()
+    # Уважаем ту же контрактность выбора конфига, что и основное приложение:
+    # APP_CONFIG_PATH позволяет переопределить путь до settings.yaml.
+    config_path = os.getenv("APP_CONFIG_PATH")
+    if config_path:
+        loader = ConfigLoader(config_path=config_path)
+    else:
+        loader = ConfigLoader()
+
     config = loader.get_config()
 
     db_dsn = _resolve_db_dsn(config)
@@ -155,14 +138,19 @@ async def _run_calibration(symbol: Optional[str], force: bool) -> None:
 
     logger.info("Starting calibration job", extra={"symbol": symbol, "force": force})
 
-    pool: asyncpg.Pool | None = None
     redis: Redis | None = None
 
     try:
-        pool = await asyncpg.create_pool(dsn=db_dsn, min_size=1, max_size=5)
+        # Инициализируем глобальный пул соединений, как это делает основное приложение.
+        await init_pool(db_dsn)
+        logger.info(
+            "PostgreSQL pool initialized for calibration job",
+            extra={"db_dsn": db_dsn},
+        )
+
         redis = Redis.from_url(redis_dsn, encoding="utf-8", decode_responses=False)
 
-        signal_repo = _create_signal_repository(pool)
+        signal_repo = _create_signal_repository()
         service = CalibrationService(redis=redis, signal_repository=signal_repo)
 
         # 1. Если не force — сначала проверяем PSI-дрифт
@@ -203,8 +191,17 @@ async def _run_calibration(symbol: Optional[str], force: bool) -> None:
         logger.info("Calibration job completed successfully")
 
     finally:
-        if pool is not None:
-            await pool.close()
+        # Закрываем глобальный пул PostgreSQL.
+        try:
+            await close_pool()
+        except RuntimeError:
+            # Пул мог не успеть инициализироваться или уже быть закрыт.
+            logger.debug("PostgreSQL pool was not open during calibration shutdown")
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "Error while closing PostgreSQL pool during calibration shutdown"
+            )
+
         if redis is not None:
             await redis.close()
 
