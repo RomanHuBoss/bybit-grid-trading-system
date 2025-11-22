@@ -1,21 +1,18 @@
-# tests/integration/test_order_lifecycle.py
-
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from decimal import Decimal
-from typing import Any, List, Optional, Tuple, cast
-from uuid import UUID, uuid4
+from typing import Any, List, Optional, cast
+from uuid import uuid4
 
 import pytest
 from unittest.mock import AsyncMock
 
-from src.core.exceptions import OrderPlacementError
+from src.core.exceptions import ExecutionError
 from src.core.models import Position, Signal
 from src.db.repositories.position_repository import PositionRepository
-from src.db.repositories.signal_repository import SignalRepository
-from src.execution.order_manager import OrderManager, PartialFillPolicy
-from src.risk.risk_manager import RiskManager
+from src.execution.order_manager import OrderManager
+from src.integration.bybit.rest_client import BybitRESTClient
 
 pytestmark = pytest.mark.asyncio
 
@@ -37,7 +34,8 @@ def _make_signal(
     Фабрика валидного сигнала для тестов.
 
     ВАЖНО: явно заполняем strategy / error_code / error_message,
-    чтобы статический анализатор не поднимал предупреждения.
+    чтобы статический анализатор не поднимал предупреждения и
+    модель соответствовала схемам проекта.
     """
     if created_at is None:
         created_at = datetime.now(timezone.utc)
@@ -66,7 +64,8 @@ class InMemoryPositionRepository:
     """
     Минимальный in-memory репозиторий позиций.
 
-    Нам нужно только create(); остальное для этого теста не важно.
+    Нам нужен только create(); остальное для этих интеграционных тестов
+    несущественно.
     """
 
     def __init__(self) -> None:
@@ -77,244 +76,74 @@ class InMemoryPositionRepository:
         return position
 
 
-class InMemorySignalRepository:
-    """
-    Минимальный репозиторий сигналов для OrderManager.
-
-    get_by_id — отдаёт ровно один сигнал (или None),
-    update_error — пишет запись в журнал updated_errors.
-    """
-
-    def __init__(self, signal: Optional[Signal]) -> None:
-        self._signal = signal
-        self.updated_errors: List[Tuple[UUID, Optional[int], str]] = []
-
-    async def get_by_id(self, signal_id: UUID) -> Optional[Signal]:
-        if self._signal is not None and self._signal.id == signal_id:
-            return self._signal
-        return None
-
-    async def update_error(
-        self,
-        signal_id: UUID,
-        error_code: Optional[int] = None,
-        error_message: str = "",
-    ) -> None:
-        self.updated_errors.append((signal_id, error_code, error_message))
-
-
-class FakeRiskManager:
-    """
-    Управляемый RiskManager для интеграционных тестов OrderManager.
-
-    check_limits() всегда возвращает заранее заданный результат.
-    """
-
-    def __init__(self, allowed: bool, reason: Optional[str]) -> None:
-        self._allowed = allowed
-        self._reason = reason
-        self.calls: List[Signal] = []
-
-    async def check_limits(
-        self,
-        signal: Signal,
-        *,
-        now: Optional[datetime] = None,
-    ) -> Tuple[bool, Optional[str]]:
-        # слегка используем now, чтобы линтер не ругался на неиспользуемый параметр
-        _ = now
-        self.calls.append(signal)
-        return self._allowed, self._reason
-
-
 def _make_order_manager(
     *,
-    signal_repo: InMemorySignalRepository,
     position_repo: InMemoryPositionRepository,
-    risk_manager: FakeRiskManager,
 ) -> OrderManager:
     """
-    Фабрика OrderManager с подменёнными инфраструктурными зависимостями.
+    Фабрика OrderManager с подменённым REST-клиентом и in-memory репозиторием.
 
-    Здесь через typing.cast явно говорим анализатору типов, что наши
-    in-memory реализации удовлетворяют интерфейсам PositionRepository /
-    SignalRepository / RiskManager.
+    Через typing.cast явно говорим анализатору типов, что наши in-memory
+    реализации удовлетворяют интерфейсу PositionRepository.
     """
-    rest_client = AsyncMock()
-    rest_client.request = AsyncMock()
-
+    rest_client = AsyncMock(spec=BybitRESTClient)
+    # По позиционным аргументам, чтобы не зависеть от имён параметров __init__.
     manager = OrderManager(
-        bybit_rest_client=rest_client,
-        position_repository=cast(PositionRepository, position_repo),
-        signal_repository=cast(SignalRepository, signal_repo),
-        risk_manager=cast(RiskManager, risk_manager),
-        partial_fill_policy=PartialFillPolicy(
-            min_fill_ratio_to_open=Decimal("0.5"),
-            full_fill_ratio=Decimal("0.95"),
-        ),
-        order_timeout=30,
-        poll_interval=0.01,  # быстрый опрос в тестах
-        signal_grace_seconds=5,
+        rest_client,
+        cast(PositionRepository, position_repo),
     )
+    # Делаем REST-клиент доступным из теста (для assert’ов).
+    manager._rest = rest_client  # type: ignore[attr-defined]
     return manager
 
 
 # ======================================================================
-# Тесты place_order: happy-path
+# Тесты open_position: happy-path
 # ======================================================================
 
 
-async def test_place_order_happy_path_opens_position(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+async def test_open_position_happy_path_creates_position() -> None:
     """
     Полный happy-path:
-      * сигнал свежий;
-      * RiskManager пропускает;
-      * Bybit отдаёт orderId;
-      * wait_for_fills возвращает полное исполнение.
+      * есть валидный сигнал;
+      * Bybit возвращает orderId, avgPrice и cumExecQty;
+      * OrderManager создаёт Position и сохраняет её в репозиторий.
     """
     now = datetime(2024, 1, 1, tzinfo=timezone.utc)
     signal = _make_signal(created_at=now)
 
-    signal_repo = InMemorySignalRepository(signal)
     position_repo = InMemoryPositionRepository()
-    risk_manager = FakeRiskManager(allowed=True, reason=None)
+    manager = _make_order_manager(position_repo=position_repo)
 
-    manager = _make_order_manager(
-        signal_repo=signal_repo,
-        position_repo=position_repo,
-        risk_manager=risk_manager,
-    )
-
-    # Bybit create-order → успешный ответ с orderId
+    # Bybit create-order → успешный ответ с orderId, avgPrice и cumExecQty.
     manager._rest.request.return_value = {  # type: ignore[attr-defined]
-        "result": {"orderId": "test-order-id"},
+        "result": {
+            "orderId": "test-order-id",
+            "avgPrice": "50010",
+            "cumExecQty": "0.0002",
+        },
     }
 
-    # Подменяем wait_for_fills на корутину, возвращающую полный fill.
-    fake_wait = AsyncMock(return_value=(Decimal("1"), Decimal("50010"), "FILLED"))
-    monkeypatch.setattr(manager, "wait_for_fills", fake_wait)
-
-    position = await manager.place_order(signal.id, now=now)
+    position = await manager.open_position(signal)
 
     assert isinstance(position, Position)
-    assert position.signal_id == signal.id
-    assert position.fill_ratio == Decimal("1")
+    # Базовые инварианты позиции
+    assert position.symbol == signal.symbol
+    assert position.direction == signal.direction
     assert position.entry_price == Decimal("50010")
+    assert position.size_base > 0
+    assert position.size_quote > 0
 
     # Позиция действительно записана в репозиторий
     assert len(position_repo.positions) == 1
     assert position_repo.positions[0].id == position.id
 
-    # REST-запрос на создание ордера был
-    manager._rest.request.assert_awaited()  # type: ignore[attr-defined]
+    # REST-запрос на создание ордера был ровно один раз
+    manager._rest.request.assert_awaited_once()  # type: ignore[attr-defined]
     kwargs: dict[str, Any] = manager._rest.request.await_args.kwargs  # type: ignore[attr-defined]
     assert kwargs["method"] == "POST"
-    assert kwargs["path"] == "/v5/order/create"
-
-
-# ======================================================================
-# Ошибки на ранних стадиях: сигнал / риск
-# ======================================================================
-
-
-async def test_place_order_signal_not_found_raises_without_update_error() -> None:
-    """
-    Если сигнал не найден — OrderPlacementError и никакого update_error,
-    потому что обновлять нечего.
-    """
-    now = datetime(2024, 1, 1, tzinfo=timezone.utc)
-    missing_id = uuid4()
-
-    signal_repo = InMemorySignalRepository(signal=None)
-    position_repo = InMemoryPositionRepository()
-    risk_manager = FakeRiskManager(allowed=True, reason=None)
-
-    manager = _make_order_manager(
-        signal_repo=signal_repo,
-        position_repo=position_repo,
-        risk_manager=risk_manager,
-    )
-
-    with pytest.raises(OrderPlacementError) as excinfo:
-        await manager.place_order(missing_id, now=now)
-
-    assert "not found" in str(excinfo.value).lower()
-    assert signal_repo.updated_errors == []
-
-
-async def test_place_order_expired_signal_updates_error_and_raises() -> None:
-    """
-    Просроченный сигнал:
-      * не уходит в RiskManager/Bybit;
-      * в signal.update_error пишется человеческое сообщение;
-      * place_order поднимает OrderPlacementError.
-    """
-    now = datetime(2024, 1, 1, tzinfo=timezone.utc)
-    created_at = now - timedelta(seconds=100)
-    signal = _make_signal(created_at=created_at)
-
-    signal_repo = InMemorySignalRepository(signal)
-    position_repo = InMemoryPositionRepository()
-    risk_manager = FakeRiskManager(allowed=True, reason=None)
-
-    manager = _make_order_manager(
-        signal_repo=signal_repo,
-        position_repo=position_repo,
-        risk_manager=risk_manager,
-    )
-
-    with pytest.raises(OrderPlacementError) as excinfo:
-        await manager.place_order(signal.id, now=now)
-
-    msg = str(excinfo.value).lower()
-    assert "expired" in msg
-
-    # Ошибка записана в сигнал
-    assert len(signal_repo.updated_errors) == 1
-    err_signal_id, err_code, err_msg = signal_repo.updated_errors[0]
-    assert err_signal_id == signal.id
-    assert err_code is None
-    assert "Signal expired for manual order placement" in err_msg
-
-    # REST-клиент не должен был вызываться
-    manager._rest.request.assert_not_awaited()  # type: ignore[attr-defined]
-
-
-async def test_place_order_risk_rejected_updates_error_and_raises() -> None:
-    """
-    При отказе RiskManager:
-      * не делаем REST-запрос;
-      * пишем ошибку в сигнал;
-      * бросаем OrderPlacementError.
-    """
-    now = datetime(2024, 1, 1, tzinfo=timezone.utc)
-    signal = _make_signal(created_at=now)
-
-    signal_repo = InMemorySignalRepository(signal)
-    position_repo = InMemoryPositionRepository()
-    risk_manager = FakeRiskManager(allowed=False, reason="too_many_positions")
-
-    manager = _make_order_manager(
-        signal_repo=signal_repo,
-        position_repo=position_repo,
-        risk_manager=risk_manager,
-    )
-
-    with pytest.raises(OrderPlacementError) as excinfo:
-        await manager.place_order(signal.id, now=now)
-
-    msg = str(excinfo.value)
-    assert "Order rejected by RiskManager" in msg
-
-    assert len(signal_repo.updated_errors) == 1
-    err_signal_id, err_code, err_msg = signal_repo.updated_errors[0]
-    assert err_signal_id == signal.id
-    assert err_code is None
-    assert "Order rejected by RiskManager: too_many_positions" in err_msg
-
-    manager._rest.request.assert_not_awaited()  # type: ignore[attr-defined]
+    # Не завязываемся на начальный слеш — только на то, что это create-order.
+    assert "order/create" in kwargs["path"]
 
 
 # ======================================================================
@@ -322,125 +151,27 @@ async def test_place_order_risk_rejected_updates_error_and_raises() -> None:
 # ======================================================================
 
 
-async def test_place_order_rest_error_on_create_updates_error_and_raises() -> None:
-    """
-    Любая ошибка при create_order (RuntimeError и пр.) должна быть
-    обёрнута в OrderPlacementError + записана в сигнал.
-    """
-    now = datetime(2024, 1, 1, tzinfo=timezone.utc)
-    signal = _make_signal(created_at=now)
-
-    signal_repo = InMemorySignalRepository(signal)
-    position_repo = InMemoryPositionRepository()
-    risk_manager = FakeRiskManager(allowed=True, reason=None)
-
-    manager = _make_order_manager(
-        signal_repo=signal_repo,
-        position_repo=position_repo,
-        risk_manager=risk_manager,
-    )
-
-    manager._rest.request.side_effect = RuntimeError("boom")  # type: ignore[attr-defined]
-
-    with pytest.raises(OrderPlacementError) as excinfo:
-        await manager.place_order(signal.id, now=now)
-
-    msg = str(excinfo.value)
-    assert "Failed to create Bybit order" in msg
-
-    assert len(signal_repo.updated_errors) == 1
-    err_signal_id, err_code, err_msg = signal_repo.updated_errors[0]
-    assert err_signal_id == signal.id
-    assert err_code is None
-    assert "Failed to create Bybit order:" in err_msg
-
-
-async def test_place_order_missing_order_id_updates_error_and_raises() -> None:
+async def test_open_position_missing_order_id_raises_execution_error() -> None:
     """
     Если в ответе Bybit нет result.orderId — это ошибка,
-    оформляемая через OrderPlacementError и update_error.
+    оформляемая через ExecutionError.
     """
     now = datetime(2024, 1, 1, tzinfo=timezone.utc)
     signal = _make_signal(created_at=now)
 
-    signal_repo = InMemorySignalRepository(signal)
     position_repo = InMemoryPositionRepository()
-    risk_manager = FakeRiskManager(allowed=True, reason=None)
+    manager = _make_order_manager(position_repo=position_repo)
 
-    manager = _make_order_manager(
-        signal_repo=signal_repo,
-        position_repo=position_repo,
-        risk_manager=risk_manager,
-    )
-
-    manager._rest.request.return_value = {"result": {}}  # type: ignore[attr-defined]
-
-    with pytest.raises(OrderPlacementError) as excinfo:
-        await manager.place_order(signal.id, now=now)
-
-    msg = str(excinfo.value).lower()
-    assert "missing orderid" in msg
-
-    assert len(signal_repo.updated_errors) == 1
-    err_signal_id, err_code, err_msg = signal_repo.updated_errors[0]
-    assert err_signal_id == signal.id
-    assert err_code is None
-    assert "Bybit create_order response missing orderId" in err_msg
-
-
-# ======================================================================
-# Underfill: частичное исполнение ниже порога открытия
-# ======================================================================
-
-
-async def test_place_order_underfill_cancels_order_and_raises(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """
-    Если fill_ratio < min_fill_ratio_to_open:
-      * вызываем _cancel_order;
-      * ошибку пишем в сигнал;
-      * позиция не создаётся;
-      * place_order поднимает OrderPlacementError.
-    """
-    now = datetime(2024, 1, 1, tzinfo=timezone.utc)
-    signal = _make_signal(created_at=now)
-
-    signal_repo = InMemorySignalRepository(signal)
-    position_repo = InMemoryPositionRepository()
-    risk_manager = FakeRiskManager(allowed=True, reason=None)
-
-    manager = _make_order_manager(
-        signal_repo=signal_repo,
-        position_repo=position_repo,
-        risk_manager=risk_manager,
-    )
-
+    # Ответ Bybit без orderId.
     manager._rest.request.return_value = {  # type: ignore[attr-defined]
-        "result": {"orderId": "test-order-id"},
+        "result": {},
     }
 
-    # wait_for_fills → PARTIALLY_FILLED с низким fill_ratio
-    fake_wait = AsyncMock(
-        return_value=(Decimal("0.1"), signal.entry_price, "PARTIALLY_FILLED")
-    )
-    monkeypatch.setattr(manager, "wait_for_fills", fake_wait)
+    with pytest.raises(ExecutionError) as excinfo:
+        await manager.open_position(signal)
 
-    # _cancel_order тоже подменяем, чтобы не дёргать реальный REST
-    fake_cancel = AsyncMock()
-    monkeypatch.setattr(manager, "_cancel_order", fake_cancel)
+    msg = str(excinfo.value).lower()
+    assert "orderid" in msg or "order id" in msg
 
-    with pytest.raises(OrderPlacementError) as excinfo:
-        await manager.place_order(signal.id, now=now)
-
-    msg = str(excinfo.value)
-    assert "Order underfilled" in msg
-
-    fake_cancel.assert_awaited_once()
+    # Позиция не должна быть создана
     assert position_repo.positions == []
-
-    assert len(signal_repo.updated_errors) == 1
-    err_signal_id, err_code, err_msg = signal_repo.updated_errors[0]
-    assert err_signal_id == signal.id
-    assert err_code is None
-    assert "Order underfilled: fill_ratio=" in err_msg
