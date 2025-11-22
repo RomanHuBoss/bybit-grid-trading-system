@@ -74,6 +74,7 @@ class DataCollector:
 
         Формат топика: `orderbook.{depth}.{symbol}`.
 
+        :param symbols: перечисление торгуемых символов
         :param depth: Глубина стакана от 1 до 50.
         :raises ValueError: если depth вне диапазона [1, 50].
         """
@@ -104,15 +105,15 @@ class DataCollector:
         """
         logger.info("Starting DataCollector run loop")
 
-        async for channel, data, _seq in self._ws_client.listen():
+        async for channel, data, sequence in self._ws_client.listen():
             try:
-                is_new = await self.deduplicate_message(channel, data)
-            except KeyError:
-                # Сообщение без sequence считаем уникальным, но логируем.
+                is_new = await self.deduplicate_message(channel, sequence=sequence)
+            except Exception:
+                # В случае ошибки дедупликации считаем сообщение уникальным, но логируем.
                 logger.warning(
-                    "WS message without sequence field, publishing anyway",
+                    "Failed to deduplicate WS message, publishing anyway",
                     channel=channel,
-                    data=data,
+                    sequence=sequence,
                 )
                 is_new = True
 
@@ -139,10 +140,10 @@ class DataCollector:
         data: Dict[str, Any],
     ) -> str:
         """
-        Записать сообщение в Redis Stream.
+        Опубликовать сообщение в указанный Redis Stream.
 
-        :param stream: Логическое имя стрима (без префикса), например `kline:5m`.
-        :param data: Плоский словарь данных сообщения.
+        :param stream: Логическое имя потока без префикса, например `kline:5m`.
+        :param data: Словарь с данными сообщения.
         :return: Идентификатор сообщения в Stream.
         :raises RedisError: при ошибке записи в Redis.
         """
@@ -161,8 +162,8 @@ class DataCollector:
     async def deduplicate_message(
         self,
         channel: str,
-        msg: Dict[str, Any],
         *,
+        sequence: int,
         ttl_seconds: Optional[int] = 3600,
     ) -> bool:
         """
@@ -174,24 +175,10 @@ class DataCollector:
             * иначе обновляем last_seq и возвращаем True.
 
         :param channel: Имя WS-канала (`topic`), например `kline.5.BTCUSDT`.
-        :param msg: Распарсенное сообщение WS (ожидается поле `sequence`).
+        :param sequence: Порядковый номер сообщения из Bybit WS.
         :param ttl_seconds: TTL ключа last_seq в Redis, по умолчанию 1 час.
         :return: True, если сообщение новое; False, если дубликат/устаревшее.
-        :raises KeyError: если в сообщении нет поля `sequence`.
         """
-        if "sequence" not in msg:
-            raise KeyError("WS message does not contain 'sequence' field")
-
-        try:
-            sequence = int(msg["sequence"])
-        except (TypeError, ValueError):
-            logger.warning(
-                "Non-integer sequence in WS message, treating as unique",
-                channel=channel,
-                sequence=msg.get("sequence"),
-            )
-            return True
-
         key = f"last_seq:{channel}"
         last_seq_raw = await self._redis.get(key)
         last_seq: Optional[int] = None
@@ -248,7 +235,7 @@ class DataCollector:
 
         if kind == "orderbook":
             depth = parts[1] if len(parts) > 1 else "10"
-            return f"ob:L{depth}"
+            return f"ob:L10" if depth == "10" else f"ob:L{depth}"
 
         # Фоллбэк для неизвестных каналов.
         return channel.replace(".", ":")
