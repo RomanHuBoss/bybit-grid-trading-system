@@ -8,17 +8,16 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Optional, Tuple
 from uuid import UUID, uuid4
 
-try:
-    import jwt  # type: ignore[import]
-    from jwt import ExpiredSignatureError as PyJWTExpiredSignatureError, InvalidTokenError as PyJWTInvalidTokenError  # type: ignore[import]
-except ImportError:  # pragma: no cover - библиотека может отсутствовать в окружении выполнения
-    jwt = None  # type: ignore[assignment]
-    PyJWTExpiredSignatureError = PyJWTInvalidTokenError = None  # type: ignore[assignment]
-
+import jwt  # type: ignore[import]
 
 from src.core.config_loader import ConfigLoader
 
 logger = logging.getLogger(__name__)
+
+# Явные алиасы для исключений PyJWT.
+# Так IDE и type-checker видят нормальный модуль, а мы можем маппить их в доменные ошибки.
+PyJWTExpiredSignatureError = jwt.ExpiredSignatureError  # type: ignore[attr-defined]
+PyJWTInvalidTokenError = jwt.InvalidTokenError  # type: ignore[attr-defined]
 
 
 @dataclass(slots=True)
@@ -56,20 +55,6 @@ class RevokedTokenError(JWTManagerError):
 # Кеш настроек и singleton-экземпляр менеджера
 _JWT_SETTINGS: Optional[JWTSettings] = None
 _JWT_MANAGER: Optional["JWTAuthManager"] = None
-
-
-def _require_jwt_lib() -> None:
-    """
-    Убедиться, что библиотека PyJWT доступна.
-
-    Отдельная функция, чтобы давать осмысленную ошибку,
-    а не ImportError где-нибудь внутри.
-    """
-    if jwt is None:
-        raise RuntimeError(
-            "PyJWT is required for JWT operations but is not installed "
-            "(install 'pyjwt' or configure JWT backend accordingly)."
-        )
 
 
 def _load_jwt_settings() -> JWTSettings:
@@ -307,8 +292,6 @@ class JWTAuthManager:
         :raises ExpiredTokenError: если токен истёк.
         :raises InvalidTokenError: при любом нарушении формата/подписи.
         """
-        _require_jwt_lib()
-
         try:
             payload = jwt.decode(
                 token,
@@ -414,7 +397,6 @@ class JWTAuthManager:
                     )
                 base_claims[key] = value
 
-        _require_jwt_lib()
         token = jwt.encode(
             base_claims,
             key=self._settings.secret,
