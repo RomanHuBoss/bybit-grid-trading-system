@@ -1,13 +1,71 @@
 # config/settings.yaml
+#
+# Базовый конфиг приложения AVI-5 для dev/standalone окружения.
+# Структура файла соответствует RootConfigSchema из config/schema.py.
 
 trading:
-  # Максимальный размер позиции (stake) для стратегии AVI-5 в базовой валюте счёта.
+  # Максимальный риск на сделку (1R) в USD.
+  # Используется как верхняя граница размера позиции/ставки для одной сделки.
   max_stake: 100
+
+  # Режим исследовательских логов/метрик:
+  # при включении пишутся дополнительные события и метрики для анализа.
+  research_mode: false
+
 
 risk:
   # Максимальное количество одновременных открытых позиций.
   max_concurrent: 5
 
+  # Максимальный суммарный риск во всех позициях в единицах R.
+  # Например, 5.0 означает, что одновременно по всем позициям не рискуем более 5R.
+  max_total_risk_r: 5.0
+
+  # Максимум открытых позиций на один базовый актив (символ).
+  max_positions_per_symbol: 2
+
+  # Минимальный интервал (в минутах) между закрытием и новым открытием позиции
+  # по тому же символу (anti-churn защита).
+  anti_churn_cooldown_minutes: 15
+
+
 bybit:
-  # Публичная часть Bybit API key, берётся из переменной окружения.
+  # Секция Bybit не хранит реальные секреты — они подставляются из ENV/Vault.
+  # Здесь — только структура и базовые URL’ы.
+
+  # Публичная часть API key (как правило, берётся из окружения BYBIT_API_KEY).
   api_key: "${BYBIT_API_KEY}"
+
+  # Секретный ключ API (как правило, берётся из окружения BYBIT_API_SECRET).
+  api_secret: "${BYBIT_API_SECRET}"
+
+  # Базовый URL REST API Bybit.
+  rest_base_url: "https://api.bybit.com"
+
+  # Публичный WebSocket эндпоинт.
+  ws_public_url: "wss://stream.bybit.com/v5/public/linear"
+
+  # Приватный WebSocket эндпоинт.
+  ws_private_url: "wss://stream.bybit.com/v5/private"
+
+
+db:
+  # DSN для подключения к TimescaleDB/PostgreSQL.
+  # В докере, как правило, переопределяется через ENV (DATABASE_URL/DB_DSN),
+  # но для локального запуска удобно иметь дефолт на localhost.
+  dsn: "postgresql://avi5:avi5@localhost:5432/avi5"
+
+  # Параметры пула соединений asyncpg.
+  pool_min_size: 1
+  pool_max_size: 10
+
+
+ui:
+  # Базовый URL фронтенда/UI.
+  public_base_url: "http://localhost:8000"
+
+  # Флаг включения SSE-стриминга для UI.
+  enable_sse: true
+
+  # Имя канала pub/sub для realtime-событий (сигналы/позиции).
+  sse_channel: "signals"
