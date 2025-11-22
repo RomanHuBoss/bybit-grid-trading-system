@@ -8,16 +8,17 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Optional, Tuple
 from uuid import UUID, uuid4
 
-import jwt  # type: ignore[import]
+import jwt  # type: ignore[import-untyped]
+from jwt import (  # type: ignore[import-untyped]
+    ExpiredSignatureError as PyJWTExpiredSignatureError,
+    InvalidTokenError as PyJWTInvalidTokenError,
+    decode as jwt_decode,
+    encode as jwt_encode,
+)
 
 from src.core.config_loader import ConfigLoader
 
 logger = logging.getLogger(__name__)
-
-# Явные алиасы для исключений PyJWT.
-# Так IDE и type-checker видят нормальный модуль, а мы можем маппить их в доменные ошибки.
-PyJWTExpiredSignatureError = jwt.ExpiredSignatureError  # type: ignore[attr-defined]
-PyJWTInvalidTokenError = jwt.InvalidTokenError  # type: ignore[attr-defined]
 
 
 @dataclass(slots=True)
@@ -293,7 +294,7 @@ class JWTAuthManager:
         :raises InvalidTokenError: при любом нарушении формата/подписи.
         """
         try:
-            payload = jwt.decode(
+            payload = jwt_decode(
                 token,
                 key=self._settings.secret,
                 algorithms=[self._settings.algorithm],
@@ -397,7 +398,7 @@ class JWTAuthManager:
                     )
                 base_claims[key] = value
 
-        token = jwt.encode(
+        token = jwt_encode(
             base_claims,
             key=self._settings.secret,
             algorithm=self._settings.algorithm,
