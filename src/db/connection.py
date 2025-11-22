@@ -7,38 +7,65 @@ import asyncpg
 
 logger = logging.getLogger(__name__)
 
+# Глобальный пул подключений к PostgreSQL.
+# Используем простое хранение в модуле, чтобы не тащить зависимость
+# от DI-фреймворков во всё приложение.
 __pg_pool: Optional[asyncpg.Pool] = None
-__pg_dsn: Optional[str] = None
 __pool_closed: bool = False
 
 # Публичный контракт модуля
 __all__ = ["init_pool", "get_pool", "close_pool"]
 
 
-async def init_pool(dsn: str) -> asyncpg.Pool:
+async def init_pool(
+    dsn: str,
+    *,
+    pool_min_size: int | None = None,
+    pool_max_size: int | None = None,
+) -> asyncpg.Pool:
     """
     Инициализировать глобальный пул соединений к PostgreSQL.
 
-    - Создаёт asyncpg.Pool с min_size=5, max_size=20.
+    Контракт:
+
+    - `dsn` — итоговая строка подключения (уже полученная из AppConfig/ENV).
+    - `pool_min_size` / `pool_max_size` — размеры пула.
+      Обычно они приходят из `DBConfig` / `DBConfigSchema`:
+
+          AppConfig.db.pool_min_size
+          AppConfig.db.pool_max_size
+
+    Поведение:
+
+    - Создаёт `asyncpg.Pool` с переданными размерами (или дефолтами).
     - Выполняет health-check запросом `SELECT 1`.
     - Кеширует пул в модуле и возвращает его.
-    - При невозможности подключиться выбрасывает ConnectionError.
-
-    Повторный вызов, если пул уже живой, возвращает существующий экземпляр.
+    - При невозможности подключиться выбрасывает `ConnectionError`.
+    - Повторный вызов, если пул уже живой, возвращает существующий экземпляр.
     """
-    global __pg_pool, __pg_dsn, __pool_closed
+    global __pg_pool, __pool_closed
 
     if __pg_pool is not None and not __pool_closed:
         # Пул уже инициализирован и не закрыт — просто возвращаем его.
         return __pg_pool
 
-    logger.info("Initializing PostgreSQL connection pool")
+    # Значения по умолчанию синхронизированы с DBConfig/DBConfigSchema:
+    # db.pool_min_size = 1, db.pool_max_size = 10
+    min_size = pool_min_size if pool_min_size is not None else 1
+    max_size = pool_max_size if pool_max_size is not None else 10
 
-    __pg_dsn = dsn
+    if max_size < min_size:
+        raise ValueError("pool_max_size must be >= pool_min_size")
+
+    logger.info(
+        "Initializing PostgreSQL connection pool",
+        extra={"pool_min_size": min_size, "pool_max_size": max_size},
+    )
+
     pool: Optional[asyncpg.Pool] = None
 
     try:
-        pool = await asyncpg.create_pool(dsn=dsn, min_size=5, max_size=20)
+        pool = await asyncpg.create_pool(dsn=dsn, min_size=min_size, max_size=max_size)
 
         # Health-check: убеждаемся, что подключение живое.
         async with pool.acquire() as conn:
