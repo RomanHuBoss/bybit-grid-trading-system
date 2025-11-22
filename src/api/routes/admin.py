@@ -3,6 +3,8 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Optional
 
+import json
+
 from fastapi import APIRouter, Depends, Request
 from pydantic import BaseModel
 from redis.asyncio import Redis
@@ -14,7 +16,9 @@ __all__ = ["router"]
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 
-_KILL_SWITCH_KEY = "kill_switch:state"
+# Ключи в Redis для хранения состояния kill-switch.
+_KILL_SWITCH_STATE_KEY = "kill_switch:state"  # детальное состояние (JSON)
+_KILL_SWITCH_ACTIVE_KEY = "kill_switch:active"  # простой флаг для потребителей/мониторинга
 
 
 # --------------------------------------------------------------------------- #
@@ -57,39 +61,72 @@ def get_metrics() -> Metrics:
 
 
 # --------------------------------------------------------------------------- #
-# Модели ответов/запросов
+# Модели запросов/ответов
 # --------------------------------------------------------------------------- #
 
 
 class KillSwitchStatus(BaseModel):
+    """
+    Внутреннее представление состояния kill-switch.
+
+    Используется как ответ для GET `/admin/kill_switch` и как основа
+    для сериализации в Redis.
+    """
+
     active: bool
     reason: Optional[str] = None
     updated_at: datetime
 
 
-class KillSwitchUpdateRequest(BaseModel):
-    active: bool
+class KillSwitchRequest(BaseModel):
+    """
+    Тело запроса для POST `/admin/kill_switch`.
+
+    По умолчанию (`active=True`) — включает kill-switch. При передаче
+    `active=False` — выключает его. Поле `reason` используется только
+    для UI/аудита и логов.
+
+    При этом форма из документации:
+
+        {"reason": "Manual kill switch due to abnormal behavior"}
+
+    остаётся валидной, так как `active` имеет значение по умолчанию.
+    """
+
+    active: bool = True
     reason: Optional[str] = None
 
 
-# --------------------------------------------------------------------------- #
-# Kill-switch
-# --------------------------------------------------------------------------- #
-
-
-@router.get("/kill-switch", response_model=KillSwitchStatus)
-async def get_kill_switch(
-    redis: Redis = Depends(get_redis),
-) -> KillSwitchStatus:
+class KillSwitchResponse(BaseModel):
     """
-    Получить текущее состояние kill-switch.
+    Формат ответа, выровненный с docs/api.md (§8.1).
 
-    Kill-switch хранится в Redis в ключе `_KILL_SWITCH_KEY` в виде JSON:
+    Пример из документации:
+
+        {
+          "kill_switch_active": true
+        }
+    """
+
+    kill_switch_active: bool
+
+
+# --------------------------------------------------------------------------- #
+# Вспомогательные функции для работы с Redis
+# --------------------------------------------------------------------------- #
+
+
+async def _load_kill_switch_state(redis: Redis) -> KillSwitchStatus:
+    """
+    Загрузить текущее состояние kill-switch из Redis.
+
+    Формат в Redis (ключ `_KILL_SWITCH_STATE_KEY`):
         {"active": bool, "reason": str | null, "updated_at": "<iso8601>"}
 
-    Если ключа нет — считаем, что kill-switch выключен (active=False).
+    При отсутствии ключа или некорректном содержимом считаем, что
+    kill-switch выключен.
     """
-    raw = await redis.get(_KILL_SWITCH_KEY)
+    raw = await redis.get(_KILL_SWITCH_STATE_KEY)
     if raw is None:
         return KillSwitchStatus(
             active=False,
@@ -98,12 +135,11 @@ async def get_kill_switch(
         )
 
     try:
-        import json
-
         data = json.loads(raw)
         active = bool(data.get("active", False))
         reason = data.get("reason")
         updated_raw = data.get("updated_at")
+
         if updated_raw is not None:
             updated_at = datetime.fromisoformat(str(updated_raw))
             if updated_at.tzinfo is None:
@@ -121,34 +157,17 @@ async def get_kill_switch(
     return KillSwitchStatus(active=active, reason=reason, updated_at=updated_at)
 
 
-@router.put("/kill-switch", response_model=KillSwitchStatus)
-async def set_kill_switch(
-    payload: KillSwitchUpdateRequest,
-    redis: Redis = Depends(get_redis),
-    ui_notifier: UINotifier = Depends(get_ui_notifier),
-    metrics: Metrics = Depends(get_metrics),
-) -> KillSwitchStatus:
+async def _persist_kill_switch_state(redis: Redis, state: KillSwitchStatus) -> None:
     """
-    Установить состояние kill-switch.
+    Сохранить состояние kill-switch в Redis.
 
-    - active=True  → включить kill-switch (новые позиции не открываем);
-    - active=False → выключить kill-switch (разрешить открытие новых позиций).
-
-    Причина (reason) опциональна и используется только для UI/аудита.
+    - В `_KILL_SWITCH_STATE_KEY` кладётся подробное состояние (JSON);
+    - В `_KILL_SWITCH_ACTIVE_KEY` — простой флаг для потребителей
+      (например, SignalEngine), как описано в project_overview.md.
     """
-    now = datetime.now(timezone.utc)
-
-    state = KillSwitchStatus(
-        active=payload.active,
-        reason=payload.reason,
-        updated_at=now,
-    )
-
-    # Сохраняем состояние в Redis как JSON.
-    import json
-
+    # Подробное состояние для UI/отладки.
     await redis.set(
-        _KILL_SWITCH_KEY,
+        _KILL_SWITCH_STATE_KEY,
         json.dumps(
             {
                 "active": state.active,
@@ -158,14 +177,66 @@ async def set_kill_switch(
         ),
     )
 
+    # Простой флаг, который удобно читать из других компонентов.
+    await redis.set(_KILL_SWITCH_ACTIVE_KEY, "1" if state.active else "0")
+
+
+# --------------------------------------------------------------------------- #
+# Kill-switch API
+# --------------------------------------------------------------------------- #
+
+
+@router.get("/kill_switch", response_model=KillSwitchStatus)
+async def get_kill_switch(
+    redis: Redis = Depends(get_redis),
+) -> KillSwitchStatus:
+    """
+    Получить текущее состояние kill-switch.
+
+    Эндпоинт не описан явно в docs/api.md, но удобен для UI и отладки.
+    Формат ответа совпадает с `KillSwitchStatus`.
+    """
+    return await _load_kill_switch_state(redis)
+
+
+@router.post("/kill_switch", response_model=KillSwitchResponse)
+async def set_kill_switch(
+    payload: KillSwitchRequest,
+    redis: Redis = Depends(get_redis),
+    ui_notifier: UINotifier = Depends(get_ui_notifier),
+    metrics: Metrics = Depends(get_metrics),
+) -> KillSwitchResponse:
+    """
+    Включить или выключить kill-switch вручную.
+
+    Документация (`docs/api.md`, §8.1) описывает кейс принудительного
+    выключения торговли и возвращает только поле `kill_switch_active`.
+
+    Здесь по умолчанию (`active=True`) включаем kill-switch, но допускаем
+    явное выключение (`active=False`) тем же эндпоинтом.
+    """
+    now = datetime.now(timezone.utc)
+
+    state = KillSwitchStatus(
+        active=payload.active,
+        reason=payload.reason,
+        updated_at=now,
+    )
+
+    # Сохраняем состояние в Redis (детальное + простой флаг).
+    await _persist_kill_switch_state(redis, state)
+
     # Уведомляем UI через UINotifier.
-    await ui_notifier.publish_kill_switch(
-        active=state.active,
-        reason=state.reason,
+    await ui_notifier.notify_kill_switch(
+        {
+            "active": state.active,
+            "reason": state.reason,
+            "updated_at": state.updated_at.isoformat(),
+        }
     )
 
     # Метрики можно использовать для учёта переключений (если понадобится).
     # Сейчас просто инициализируем синглтон, чтобы он зарегистрировал метрики.
     _ = metrics  # noqa: F841
 
-    return state
+    return KillSwitchResponse(kill_switch_active=state.active)
