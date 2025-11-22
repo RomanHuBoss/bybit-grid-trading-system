@@ -27,6 +27,7 @@ def make_limits(
     max_positions_per_symbol: int = 2,
     per_symbol_risk_r: dict[str, Decimal] | None = None,
 ) -> RiskLimits:
+    """Создаёт объект RiskLimits с адекватными значениями по умолчанию."""
     return RiskLimits(
         max_concurrent=max_concurrent,
         max_total_risk_r=max_total_risk_r,
@@ -35,42 +36,27 @@ def make_limits(
     )
 
 
-def make_position(symbol: str = "BTCUSDT") -> Position:
-    now = datetime.now(timezone.utc)
-    return Position(
-        id=uuid4(),
-        signal_id=uuid4(),
-        opened_at=now,
-        closed_at=None,
-        symbol=symbol,
-        direction="long",
-        entry_price=Decimal("100"),
-        size_base=Decimal("1"),
-        size_quote=Decimal("100"),
-        fill_ratio=Decimal("1"),
-        slippage=Decimal("0"),
-        funding=Decimal("0"),
-    )
-
-
-def make_signal(symbol: str = "BTCUSDT", direction: str = "long") -> Signal:
-    """
-    Конструктор тестового сигнала.
-
-    Специально заполняем поля strategy / error_code / error_message,
-    чтобы IDE не подсвечивала их как "unfilled".
-    """
+def make_signal(
+    symbol: str = "BTCUSDT",
+    direction: str = "long",
+    *,
+    entry_price: Decimal = Decimal("100"),
+    stake_usd: Decimal = Decimal("10"),
+    probability: Decimal = Decimal("0.5"),
+    strategy_version: str = "avi5-1.0.0",
+) -> Signal:
+    """Конструктор тестового сигнала, совместимый с актуальной моделью Signal."""
     now = datetime.now(timezone.utc)
     return Signal(
         id=uuid4(),
         created_at=now,
         symbol=symbol,
         direction=direction,
-        entry_price=Decimal("100"),
-        stake_usd=Decimal("10"),
-        probability=Decimal("0.5"),
+        entry_price=entry_price,
+        stake_usd=stake_usd,
+        probability=probability,
         strategy="AVI-5",
-        strategy_version="test",
+        strategy_version=strategy_version,
         queued_until=None,
         tp1=None,
         tp2=None,
@@ -78,6 +64,42 @@ def make_signal(symbol: str = "BTCUSDT", direction: str = "long") -> Signal:
         stop_loss=None,
         error_code=None,
         error_message=None,
+    )
+
+
+def make_position(
+    symbol: str = "BTCUSDT",
+    direction: str = "long",
+    *,
+    signal_id=None,
+    entry_price: Decimal = Decimal("100"),
+    size_base: Decimal = Decimal("1"),
+    size_quote: Decimal | None = None,
+    opened_at: datetime | None = None,
+) -> Position:
+    """Конструктор тестовой позиции, совместимый с актуальной моделью Position."""
+    if signal_id is None:
+        signal_id = uuid4()
+    if opened_at is None:
+        opened_at = datetime.now(timezone.utc)
+    if size_quote is None:
+        size_quote = entry_price * size_base
+
+    return Position(
+        id=uuid4(),
+        signal_id=signal_id,
+        symbol=symbol,
+        side=direction,
+        entry_price=entry_price,
+        size_base=size_base,
+        size_quote=size_quote,
+        status="open",
+        opened_at=opened_at,
+        closed_at=None,
+        pnl_usd=None,
+        fill_ratio=Decimal("1"),
+        slippage=Decimal("0"),
+        funding=Decimal("0"),
     )
 
 
@@ -94,11 +116,8 @@ def redis_mock() -> AsyncMock:
 
 @pytest.fixture
 def position_repo_mock() -> AsyncMock:
-    """
-    Мок репозитория позиций: все async-методы заменены на AsyncMock.
-    """
+    """Мок репозитория позиций: все async-методы заменены на AsyncMock."""
     repo = AsyncMock(spec=PositionRepository)
-    # По умолчанию считаем, что открытых позиций нет.
     repo.list_open = AsyncMock(return_value=[])
     return repo
 
@@ -109,9 +128,7 @@ def make_risk_manager(
     redis: AsyncMock,
     position_repo: AsyncMock,
 ) -> RiskManager:
-    """
-    Утилита для создания RiskManager с кастомными лимитами и моками.
-    """
+    """Утилита для создания RiskManager с кастомными лимитами и моками."""
     if limits is None:
         limits = make_limits()
     return RiskManager(
@@ -139,19 +156,8 @@ async def test_check_limits_blocked_by_anti_churn(
     """
     from src.risk import risk_manager as risk_module
 
-    async def fake_is_blocked(
-        _redis,
-        symbol: str,
-        side: str,
-        now: datetime | None = None,
-    ):
-        # немного используем параметры, чтобы не было warning-ов
-        assert symbol == "BTCUSDT"
-        assert side == "long"
-        assert isinstance(now, (datetime, type(None)))
-        return True, datetime.now(timezone.utc)
-
-    monkeypatch.setattr(risk_module.AntiChurnGuard, "is_blocked", fake_is_blocked)
+    is_blocked_mock = AsyncMock(return_value=(True, datetime.now(timezone.utc)))
+    monkeypatch.setattr(risk_module.AntiChurnGuard, "is_blocked", is_blocked_mock)
 
     rm = make_risk_manager(redis=redis_mock, position_repo=position_repo_mock)
     sig = make_signal()
@@ -160,6 +166,15 @@ async def test_check_limits_blocked_by_anti_churn(
 
     assert allowed is False
     assert reason == "anti_churn_block"
+
+    is_blocked_mock.assert_awaited_once()
+    args, kwargs = is_blocked_mock.call_args
+    # AntiChurnGuard.is_blocked(self._redis, signal.symbol, signal.direction, now=...)
+    assert args[0] is redis_mock
+    assert args[1] == sig.symbol
+    assert args[2] == sig.direction
+    assert "now" in kwargs
+
     position_repo_mock.list_open.assert_not_awaited()
 
 
@@ -180,17 +195,9 @@ async def test_check_limits_rejects_when_max_concurrent_reached(
     """
     from src.risk import risk_manager as risk_module
 
-    async def fake_is_blocked(
-        _redis,
-        _symbol: str,
-        _side: str,
-        _now: datetime | None = None,
-    ):
-        return False, None
+    is_blocked_mock = AsyncMock(return_value=(False, None))
+    monkeypatch.setattr(risk_module.AntiChurnGuard, "is_blocked", is_blocked_mock)
 
-    monkeypatch.setattr(risk_module.AntiChurnGuard, "is_blocked", fake_is_blocked)
-
-    # max_concurrent=2, а открытых позиций уже 2
     limits = make_limits(max_concurrent=2, max_total_risk_r=Decimal("10"))
     open_positions: List[Position] = [make_position(), make_position()]
     position_repo_mock.list_open = AsyncMock(return_value=open_positions)
@@ -206,7 +213,7 @@ async def test_check_limits_rejects_when_max_concurrent_reached(
 
 
 # =====================================================================
-# per-base limit (position_limits.can_open_position_for_base)
+# per-base limit
 # =====================================================================
 
 
@@ -216,41 +223,29 @@ async def test_check_limits_rejects_when_per_base_limit_fails(
     redis_mock: AsyncMock,
     position_repo_mock: AsyncMock,
 ) -> None:
-    """
-    Если can_open_position_for_base возвращает False,
-    должен вернуться reason='per_base_limit'.
-    """
+    """Если can_open_position_for_base возвращает False, reason='per_base_limit'."""
     from src.risk import risk_manager as risk_module
 
-    async def fake_is_blocked(
-        _redis,
-        _symbol: str,
-        _side: str,
-        _now: datetime | None = None,
-    ):
-        return False, None
-
-    monkeypatch.setattr(risk_module.AntiChurnGuard, "is_blocked", fake_is_blocked)
+    is_blocked_mock = AsyncMock(return_value=(False, None))
+    monkeypatch.setattr(risk_module.AntiChurnGuard, "is_blocked", is_blocked_mock)
 
     async def fake_list_open(symbol: str | None = None):
-        assert symbol is None  # RiskManager.list_open вызывает без фильтра
+        assert symbol is None
         return [make_position(), make_position()]
 
     position_repo_mock.list_open = AsyncMock(side_effect=fake_list_open)
 
-    # Патчим функцию can_open_position_for_base, импортированную в risk_manager.
     def fake_can_open(
         positions: List[Position],
         symbol: str,
         direction: str,
         max_positions_per_base: int,
     ) -> bool:
-        # Используем параметры, чтобы линтер был доволен.
+        # Чуть-чуть трогаем аргументы, чтобы PyCharm не ругался на неиспользуемые.
         assert len(positions) == 2
         assert symbol == "BTCUSDT"
         assert direction == "long"
         assert isinstance(max_positions_per_base, int)
-        # Имитация нарушения per-base лимита.
         return False
 
     monkeypatch.setattr(risk_module, "can_open_position_for_base", fake_can_open)
@@ -258,7 +253,7 @@ async def test_check_limits_rejects_when_per_base_limit_fails(
     limits = make_limits(
         max_concurrent=10,
         max_total_risk_r=Decimal("10"),
-        max_positions_per_symbol=1,
+        max_positions_per_symbol=10,
     )
     rm = make_risk_manager(limits=limits, redis=redis_mock, position_repo=position_repo_mock)
     sig = make_signal()
@@ -281,48 +276,35 @@ async def test_check_limits_respects_max_total_risk_r(
     redis_mock: AsyncMock,
     position_repo_mock: AsyncMock,
 ) -> None:
-    """
-    _check_total_risk интерпретирует количество позиций как суммарный риск в R.
-    proposed_total_risk_r = len(open_positions) + 1
-    должен быть <= max_total_risk_r, иначе reason='max_total_risk_r'.
-    """
+    """Если суммарный риск превышает max_total_risk_r, reason='max_total_risk_r'."""
     from src.risk import risk_manager as risk_module
 
-    async def fake_is_blocked(
-        _redis,
-        _symbol: str,
-        _side: str,
-        _now: datetime | None = None,
-    ):
-        return False, None
-
-    monkeypatch.setattr(risk_module.AntiChurnGuard, "is_blocked", fake_is_blocked)
-
-    # 2 уже открыты, max_total_risk_r=2 → новая позиция даст 3R > 2R
-    existing_positions = [make_position(), make_position()]
-    position_repo_mock.list_open = AsyncMock(return_value=existing_positions)
-
-    # per-base лимит пропускает
-    def fake_can_open(
-        positions: List[Position],
-        symbol: str,
-        direction: str,
-        max_positions_per_base: int,
-    ) -> bool:
-        # чтобы не было warning-ов, слегка трогаем параметры
-        assert len(positions) == 2
-        assert symbol == "BTCUSDT"
-        assert direction == "long"
-        assert isinstance(max_positions_per_base, int)
-        return True
-
-    monkeypatch.setattr(risk_module, "can_open_position_for_base", fake_can_open)
+    is_blocked_mock = AsyncMock(return_value=(False, None))
+    monkeypatch.setattr(risk_module.AntiChurnGuard, "is_blocked", is_blocked_mock)
 
     limits = make_limits(
         max_concurrent=10,
         max_total_risk_r=Decimal("2"),
         max_positions_per_symbol=10,
     )
+    open_positions: List[Position] = [make_position(), make_position()]
+    position_repo_mock.list_open = AsyncMock(return_value=open_positions)
+
+    def fake_can_open(
+        positions: List[Position],
+        symbol: str,
+        direction: str,
+        max_positions_per_base: int,
+    ) -> bool:
+        assert len(positions) == 2
+        assert symbol == "BTCUSDT"
+        assert direction == "long"
+        assert isinstance(max_positions_per_base, int)
+        # per-base лимит пропускает
+        return True
+
+    monkeypatch.setattr(risk_module, "can_open_position_for_base", fake_can_open)
+
     rm = make_risk_manager(limits=limits, redis=redis_mock, position_repo=position_repo_mock)
     sig = make_signal()
 
@@ -344,28 +326,15 @@ async def test_check_limits_respects_per_symbol_risk(
     redis_mock: AsyncMock,
     position_repo_mock: AsyncMock,
 ) -> None:
-    """
-    Если для символа есть отдельный лимит per_symbol_risk_r и
-    текущие позиции уже исчерпали его, check_limits должен вернуть
-    reason='per_symbol_risk_r'.
-    """
+    """Если per_symbol_risk_r для символа исчерпан, reason='per_symbol_risk_r'."""
     from src.risk import risk_manager as risk_module
 
-    async def fake_is_blocked(
-        _redis,
-        _symbol: str,
-        _side: str,
-        _now: datetime | None = None,
-    ):
-        return False, None
+    is_blocked_mock = AsyncMock(return_value=(False, None))
+    monkeypatch.setattr(risk_module.AntiChurnGuard, "is_blocked", is_blocked_mock)
 
-    monkeypatch.setattr(risk_module.AntiChurnGuard, "is_blocked", fake_is_blocked)
-
-    # Одна открытая позиция по BTCUSDT, лимит per_symbol_risk_r=1R
     existing_positions = [make_position(symbol="BTCUSDT")]
     position_repo_mock.list_open = AsyncMock(return_value=existing_positions)
 
-    # per-base лимит пропускает
     def fake_can_open(
         positions: List[Position],
         symbol: str,
@@ -376,6 +345,7 @@ async def test_check_limits_respects_per_symbol_risk(
         assert symbol == "BTCUSDT"
         assert direction == "long"
         assert isinstance(max_positions_per_base, int)
+        # per-base лимит пропускает
         return True
 
     monkeypatch.setattr(risk_module, "can_open_position_for_base", fake_can_open)
@@ -384,7 +354,7 @@ async def test_check_limits_respects_per_symbol_risk(
         max_concurrent=10,
         max_total_risk_r=Decimal("10"),
         max_positions_per_symbol=10,
-        per_symbol_risk_r={"btcusdt": Decimal("1")},
+        per_symbol_risk_r={"BTCUSDT": Decimal("1")},
     )
     rm = make_risk_manager(limits=limits, redis=redis_mock, position_repo=position_repo_mock)
     sig = make_signal(symbol="BTCUSDT")
@@ -397,7 +367,7 @@ async def test_check_limits_respects_per_symbol_risk(
 
 
 # =====================================================================
-# Позитивный сценарий: все проверки пройдены
+# happy path
 # =====================================================================
 
 
@@ -407,23 +377,13 @@ async def test_check_limits_allows_when_all_constraints_pass(
     redis_mock: AsyncMock,
     position_repo_mock: AsyncMock,
 ) -> None:
-    """
-    Если anti-churn не блокирует, лимиты по количеству, total_risk и per-symbol
-    не нарушены — check_limits возвращает (True, None).
-    """
+    """Если все ограничения пройдены, check_limits должен разрешить вход."""
     from src.risk import risk_manager as risk_module
 
-    async def fake_is_blocked(
-        _redis,
-        _symbol: str,
-        _side: str,
-        _now: datetime | None = None,
-    ):
-        return False, None
+    is_blocked_mock = AsyncMock(return_value=(False, None))
+    monkeypatch.setattr(risk_module.AntiChurnGuard, "is_blocked", is_blocked_mock)
 
-    monkeypatch.setattr(risk_module.AntiChurnGuard, "is_blocked", fake_is_blocked)
-
-    existing_positions = [make_position(symbol="ETHUSDT")]  # другая бумага
+    existing_positions = [make_position(symbol="BTCUSDT")]
     position_repo_mock.list_open = AsyncMock(return_value=existing_positions)
 
     def fake_can_open(
@@ -440,15 +400,14 @@ async def test_check_limits_allows_when_all_constraints_pass(
 
     monkeypatch.setattr(risk_module, "can_open_position_for_base", fake_can_open)
 
-    # Лимиты достаточно широкие
     limits = make_limits(
         max_concurrent=10,
         max_total_risk_r=Decimal("10"),
         max_positions_per_symbol=5,
-        per_symbol_risk_r={"ETHUSDT": Decimal("3")},  # отдельный лимит для ETH, но не для BTC
+        per_symbol_risk_r={"ETHUSDT": Decimal("3")},
     )
     rm = make_risk_manager(limits=limits, redis=redis_mock, position_repo=position_repo_mock)
-    sig = make_signal(symbol="BTCUSDT")  # по BTC отдельного пер-символьного лимита нет
+    sig = make_signal(symbol="BTCUSDT")
 
     allowed, reason = await rm.check_limits(sig)
 
@@ -468,27 +427,24 @@ async def test_on_position_opened_records_signal_in_anti_churn(
     redis_mock: AsyncMock,
     position_repo_mock: AsyncMock,
 ) -> None:
-    """
-    on_position_opened должен вызвать AntiChurnGuard.record_signal
-    с символом и направлением позиции.
-    """
+    """on_position_opened должен вызвать AntiChurnGuard.record_signal."""
     from src.risk import risk_manager as risk_module
 
-    async_record = AsyncMock()
-
-    monkeypatch.setattr(risk_module.AntiChurnGuard, "record_signal", async_record)
+    record_mock = AsyncMock()
+    monkeypatch.setattr(risk_module.AntiChurnGuard, "record_signal", record_mock)
 
     rm = make_risk_manager(redis=redis_mock, position_repo=position_repo_mock)
     pos = make_position(symbol="BTCUSDT")
 
     await rm.on_position_opened(pos)
 
-    async_record.assert_awaited_once()
-    _args, kwargs = async_record.call_args
-    # record_signal(redis, symbol=..., side=..., now=...)
-    assert kwargs["redis"] is redis_mock
+    record_mock.assert_awaited_once()
+    args, kwargs = record_mock.call_args
+    # record_signal(self._redis, symbol=..., side=..., now=...)
+    assert args[0] is redis_mock
     assert kwargs["symbol"] == "BTCUSDT"
     assert kwargs["side"] == pos.direction
+    assert "now" in kwargs
 
 
 @pytest.mark.asyncio
@@ -497,21 +453,18 @@ async def test_on_position_closed_does_not_touch_anti_churn(
     redis_mock: AsyncMock,
     position_repo_mock: AsyncMock,
 ) -> None:
-    """
-    on_position_closed по текущей реализации ничего не делает с AntiChurnGuard —
-    только логирует событие. Проверяем, что AntiChurnGuard.* не вызывается.
-    """
+    """on_position_closed по умолчанию не вызывает AntiChurnGuard.clear_block."""
     from src.risk import risk_manager as risk_module
 
-    async_clear = AsyncMock()
-    monkeypatch.setattr(risk_module.AntiChurnGuard, "clear_block", async_clear)
+    clear_mock = AsyncMock()
+    monkeypatch.setattr(risk_module.AntiChurnGuard, "clear_block", clear_mock)
 
     rm = make_risk_manager(redis=redis_mock, position_repo=position_repo_mock)
     pos = make_position(symbol="BTCUSDT")
 
     await rm.on_position_closed(pos)
 
-    async_clear.assert_not_awaited()
+    clear_mock.assert_not_awaited()
 
 
 # =====================================================================
@@ -519,14 +472,11 @@ async def test_on_position_closed_does_not_touch_anti_churn(
 # =====================================================================
 
 
-def test_update_limits_replaces_snapshot(
+def test_update_limits_replaces_limits_object(
     redis_mock: AsyncMock,
     position_repo_mock: AsyncMock,
 ) -> None:
-    """
-    update_limits должен заменить внутренний снимок RiskLimits
-    и свойство .limits должно возвращать обновлённые значения.
-    """
+    """update_limits должен просто заменить self.limits на новый объект."""
     initial_limits = make_limits(
         max_concurrent=1,
         max_total_risk_r=Decimal("2"),
