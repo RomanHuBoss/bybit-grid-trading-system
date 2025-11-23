@@ -22,18 +22,7 @@ COPY requirements.txt ./
 
 # Конвертируем requirements.txt в UTF-8 (на случай, если он в UTF-16),
 # чтобы pip мог его корректно прочитать внутри контейнера
-RUN python - << 'PY'
-from pathlib import Path
-
-path = Path("requirements.txt")
-data = path.read_bytes()
-try:
-    text = data.decode("utf-16")
-except UnicodeError:
-    # уже UTF-8 или другая совместимая кодировка
-    text = data.decode()
-path.write_text(text, encoding="utf-8")
-PY
+RUN python -c "from pathlib import Path; p = Path('requirements.txt'); d = p.read_bytes(); t = (d.decode('utf-16') if d.startswith(bytes([255,254])) or d.startswith(bytes([254,255])) else d.decode()); p.write_text(t, encoding='utf-8')"
 
 # Устанавливаем зависимости в user-окружение (см. спецификацию)
 RUN pip install --no-cache-dir --user -r requirements.txt
@@ -72,4 +61,4 @@ USER nobody
 EXPOSE 8000
 
 # Запуск приложения через Uvicorn
-CMD ["uvicorn", "src.main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["uvicorn", "src.main:app", "--host", "0.0.0.0", "--port",  "8000"]
