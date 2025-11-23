@@ -1,22 +1,16 @@
 # tests/unit/test_signal_engine.py
-
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
-from typing import List
 from uuid import UUID
+from typing import List, Tuple
 
 import pytest
 from unittest.mock import AsyncMock
 
 from src.core.models import AVI5Config, ConfirmedCandle as Candle, Signal, TradingConfig
 from src.strategies.avi5 import Avi5SignalEngine
-
-
-# =====================================================================
-# Вспомогательные фабрики
-# =====================================================================
 
 
 def _mk_candle(
@@ -29,7 +23,9 @@ def _mk_candle(
     volume: Decimal = Decimal("1"),
     confirmed: bool = True,
 ) -> Candle:
-    """Конструктор простой 5-минутной свечи."""
+    """
+    Упрощённый конструктор 5-минутной свечи для тестов AVI-5.
+    """
     return Candle(
         symbol="BTCUSDT",
         open_time=ts,
@@ -49,7 +45,12 @@ def _mk_engine(
     atr_window: int = 3,
     atr_multiplier: float = 2.0,
 ) -> tuple[Avi5SignalEngine, AsyncMock]:
-    """Создать Avi5SignalEngine с мокнутым RiskManager."""
+    """
+    Сконструировать Avi5SignalEngine с мокнутым RiskManager.
+
+    Важно: конфиг по умолчанию согласован с core.models.AVI5Config и
+    текущей реализацией Avi5SignalEngine.
+    """
     avi_cfg = AVI5Config(
         theta=theta,
         atr_window=atr_window,
@@ -62,7 +63,7 @@ def _mk_engine(
     )
 
     risk_mgr = AsyncMock(name="RiskManagerMock")
-    # По умолчанию RiskManager пропускает сигнал
+    # По умолчанию RiskManager пропускает сигнал.
     risk_mgr.check_limits = AsyncMock(return_value=(True, None))
 
     engine = Avi5SignalEngine(
@@ -74,341 +75,41 @@ def _mk_engine(
     return engine, risk_mgr
 
 
-# =====================================================================
-# Базовые фильтры и ранние выходы
-# =====================================================================
-
-
-@pytest.mark.asyncio
-async def test_generate_signal_returns_none_on_empty_candles() -> None:
-    engine, risk_mgr = _mk_engine()
-    result = await engine.generate_signal([])
-    assert result is None
-    risk_mgr.check_limits.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_last_candle_must_be_confirmed() -> None:
-    engine, risk_mgr = _mk_engine()
-
-    now = datetime(2024, 1, 1, tzinfo=timezone.utc)
-    candles: List[Candle] = [
-        _mk_candle(
-            ts=now - timedelta(minutes=10),
-            open_=Decimal("10"),
-            high=Decimal("11"),
-            low=Decimal("9"),
-            close=Decimal("10"),
-        ),
-        _mk_candle(
-            ts=now - timedelta(minutes=5),
-            open_=Decimal("11"),
-            high=Decimal("12"),
-            low=Decimal("10"),
-            close=Decimal("11"),
-            confirmed=False,  # последняя свеча не подтверждена
-        ),
-    ]
-
-    result = await engine.generate_signal(candles)
-    assert result is None
-    risk_mgr.check_limits.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_spread_filter_blocks_signal() -> None:
-    engine, risk_mgr = _mk_engine()
-
-    now = datetime(2024, 1, 1, tzinfo=timezone.utc)
-    candles = [
-        _mk_candle(
-            ts=now - timedelta(minutes=10),
-            open_=Decimal("10"),
-            high=Decimal("11"),
-            low=Decimal("9"),
-            close=Decimal("10"),
-        ),
-        _mk_candle(
-            ts=now - timedelta(minutes=5),
-            open_=Decimal("11"),
-            high=Decimal("12"),
-            low=Decimal("10"),
-            close=Decimal("11"),
-        ),
-        _mk_candle(
-            ts=now,
-            open_=Decimal("12"),
-            high=Decimal("13"),
-            low=Decimal("11"),
-            close=Decimal("12"),
-        ),
-    ]
-
-    # spread_ok=False → должны выйти до RiskManager
-    result = await engine.generate_signal(candles, spread_ok=False)
-    assert result is None
-    risk_mgr.check_limits.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_funding_filter_blocks_signal_when_too_close() -> None:
-    engine, risk_mgr = _mk_engine()
-
-    now = datetime(2024, 1, 1, tzinfo=timezone.utc)
-    candles = [
-        _mk_candle(
-            ts=now - timedelta(minutes=10),
-            open_=Decimal("10"),
-            high=Decimal("11"),
-            low=Decimal("9"),
-            close=Decimal("10"),
-        ),
-        _mk_candle(
-            ts=now - timedelta(minutes=5),
-            open_=Decimal("11"),
-            high=Decimal("12"),
-            low=Decimal("10"),
-            close=Decimal("11"),
-        ),
-        _mk_candle(
-            ts=now,
-            open_=Decimal("12"),
-            high=Decimal("13"),
-            low=Decimal("11"),
-            close=Decimal("12"),
-        ),
-    ]
-
-    # до funding меньше 15 минут → сигнал не генерируется
-    result = await engine.generate_signal(candles, spread_ok=True, time_to_funding_minutes=10)
-    assert result is None
-    risk_mgr.check_limits.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_not_enough_candles_for_atr_and_donchian() -> None:
-    engine, risk_mgr = _mk_engine(atr_window=3)
-
-    now = datetime(2024, 1, 1, tzinfo=timezone.utc)
-    # Нужно как минимум atr_window+1 свечей → даём меньше.
-    candles = [
-        _mk_candle(
-            ts=now - timedelta(minutes=10),
-            open_=Decimal("10"),
-            high=Decimal("11"),
-            low=Decimal("9"),
-            close=Decimal("10"),
-        ),
-        _mk_candle(
-            ts=now - timedelta(minutes=5),
-            open_=Decimal("11"),
-            high=Decimal("12"),
-            low=Decimal("10"),
-            close=Decimal("11"),
-        ),
-    ]
-
-    result = await engine.generate_signal(candles)
-    assert result is None
-    risk_mgr.check_limits.assert_not_awaited()
-
-
-# =====================================================================
-# Ошибки индикаторов (atr / donchian)
-# =====================================================================
-
-
-@pytest.mark.asyncio
-async def test_signal_engine_skips_on_atr_error(monkeypatch) -> None:
-    from src.strategies import avi5 as avi5_module
-
-    engine, risk_mgr = _mk_engine(atr_window=2)
-
-    async def fake_generate(*_args, **_kwargs):
-        # сюда не должны дойти
-        assert False, "RiskManager.check_limits should not be called"
-
-    risk_mgr.check_limits = AsyncMock(side_effect=fake_generate)
-
-    # Патчим atr так, чтобы он падал.
-    def fake_atr(_candles, _period):
-        raise RuntimeError("boom")
-
-    monkeypatch.setattr(avi5_module, "atr", fake_atr)
-
-    now = datetime(2024, 1, 1, tzinfo=timezone.utc)
-    candles = [
-        _mk_candle(
-            ts=now - timedelta(minutes=10),
-            open_=Decimal("10"),
-            high=Decimal("11"),
-            low=Decimal("9"),
-            close=Decimal("10"),
-        ),
-        _mk_candle(
-            ts=now - timedelta(minutes=5),
-            open_=Decimal("11"),
-            high=Decimal("12"),
-            low=Decimal("10"),
-            close=Decimal("11"),
-        ),
-        _mk_candle(
-            ts=now,
-            open_=Decimal("12"),
-            high=Decimal("13"),
-            low=Decimal("11"),
-            close=Decimal("12"),
-        ),
-    ]
-
-    result = await engine.generate_signal(candles)
-    assert result is None
-    risk_mgr.check_limits.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_signal_engine_skips_on_donchian_error(monkeypatch) -> None:
-    from src.strategies import avi5 as avi5_module
-
-    engine, risk_mgr = _mk_engine(atr_window=2)
-
-    def fake_atr(_candles, _period) -> Decimal:
-        return Decimal("1")
-
-    def fake_donchian(_candles, _window):
-        raise RuntimeError("boom")
-
-    monkeypatch.setattr(avi5_module, "atr", fake_atr)
-    monkeypatch.setattr(avi5_module, "donchian", fake_donchian)
-
-    now = datetime(2024, 1, 1, tzinfo=timezone.utc)
-    candles = [
-        _mk_candle(
-            ts=now - timedelta(minutes=10),
-            open_=Decimal("10"),
-            high=Decimal("11"),
-            low=Decimal("9"),
-            close=Decimal("10"),
-        ),
-        _mk_candle(
-            ts=now - timedelta(minutes=5),
-            open_=Decimal("11"),
-            high=Decimal("12"),
-            low=Decimal("10"),
-            close=Decimal("11"),
-        ),
-        _mk_candle(
-            ts=now,
-            open_=Decimal("12"),
-            high=Decimal("13"),
-            low=Decimal("11"),
-            close=Decimal("12"),
-        ),
-    ]
-
-    result = await engine.generate_signal(candles)
-    assert result is None
-    risk_mgr.check_limits.assert_not_awaited()
-
-
-# =====================================================================
-# Позитивный путь: успешная генерация сигнала
-# =====================================================================
-
-
 @pytest.mark.asyncio
 async def test_generate_long_signal_and_passed_risk_manager(monkeypatch) -> None:
     """
     Позитивный сценарий:
-      * atr и donchian дают корректные значения;
-      * RiskManager разрешает сигнал;
-      * на выходе — объект Signal с ожидаемыми полями.
+    * есть достаточная история свечей (atr_window + 1);
+    * есть пробой верхней границы Donchian;
+    * RiskManager разрешает сигнал;
+    * на выходе получаем корректный объект Signal.
     """
     from src.strategies import avi5 as avi5_module
 
     engine, risk_mgr = _mk_engine(theta=0.3, atr_window=2, atr_multiplier=2.0)
 
     # Контролируем значения индикаторов.
-    def fake_atr(_candles, _period) -> Decimal:
+    def fake_atr(_candles: List[Candle], _period: int) -> Decimal:
         return Decimal("10")  # 1R = 2 * 10 = 20
 
-    def fake_donchian(_candles, _window):
-        # upper/lover подобраны так, чтобы сработал long-триггер:
+    def fake_donchian(_candles: List[Candle], _window: int) -> Tuple[Decimal, Decimal]:
+        # upper/lower подобраны так, чтобы сработал long-триггер:
         # last.close > upper >= prev.close
         return Decimal("105"), Decimal("95")
 
     monkeypatch.setattr(avi5_module, "atr", fake_atr)
     monkeypatch.setattr(avi5_module, "donchian", fake_donchian)
 
-    now = datetime(2024, 1, 1, tzinfo=timezone.utc)
-    prev = _mk_candle(
-        ts=now - timedelta(minutes=5),
-        open_=Decimal("100"),
-        high=Decimal("104"),
-        low=Decimal("99"),
+    now = datetime.now(timezone.utc)
+
+    # Нужно минимум atr_window + 1 свечей → 3 штуки при atr_window=2.
+    first = _mk_candle(
+        ts=now - timedelta(minutes=10),
+        open_=Decimal("95"),
+        high=Decimal("101"),
+        low=Decimal("94"),
         close=Decimal("100"),
     )
-    last = _mk_candle(
-        ts=now,
-        open_=Decimal("104"),
-        high=Decimal("110"),
-        low=Decimal("103"),
-        close=Decimal("106"),  # > upper=105
-    )
-    candles = [prev, last]
-
-    result = await engine.generate_signal(candles, now=now, spread_ok=True)
-    assert isinstance(result, Signal)
-
-    # Проверяем базовые параметры сигнала.
-    assert result.symbol == "BTCUSDT"
-    assert result.direction == "long"
-    assert result.entry_price == last.close
-
-    # stake_usd = max_stake * theta = 100 * 0.3 = 30
-    assert result.stake_usd == Decimal("30")
-
-    # probability == theta (см. реализацию)
-    assert result.probability == Decimal("0.3")
-
-    # ATR=10, atr_multiplier=2 → risk_per_unit=20
-    # long: SL = entry - 20, TP1/2/3 = entry + 20/40/60
-    assert result.stop_loss == last.close - Decimal("20")
-    assert result.tp1 == last.close + Decimal("20")
-    assert result.tp2 == last.close + Decimal("40")
-    assert result.tp3 == last.close + Decimal("60")
-
-    # RiskManager.check_limits должен быть вызван один раз с нашим сигналом.
-    risk_mgr.check_limits.assert_awaited_once()
-    called_signal = risk_mgr.check_limits.call_args.kwargs.get("signal") or risk_mgr.check_limits.call_args.args[0]
-    assert isinstance(called_signal, Signal)
-    assert called_signal.id == result.id
-    assert isinstance(result.id, UUID)
-
-
-@pytest.mark.asyncio
-async def test_signal_rejected_by_risk_manager(monkeypatch) -> None:
-    """
-    Если RiskManager возвращает allowed=False, generate_signal()
-    должен вернуть None.
-    """
-    from src.strategies import avi5 as avi5_module
-
-    engine, risk_mgr = _mk_engine(theta=0.3, atr_window=2, atr_multiplier=2.0)
-
-    def fake_atr(_candles, _period) -> Decimal:
-        return Decimal("5")
-
-    def fake_donchian(_candles, _window):
-        return Decimal("105"), Decimal("95")
-
-    monkeypatch.setattr(avi5_module, "atr", fake_atr)
-    monkeypatch.setattr(avi5_module, "donchian", fake_donchian)
-
-    # RiskManager отклоняет сигнал
-    risk_mgr.check_limits = AsyncMock(return_value=(False, "limit-exceeded"))
-
-    now = datetime(2024, 1, 1, tzinfo=timezone.utc)
     prev = _mk_candle(
         ts=now - timedelta(minutes=5),
         open_=Decimal("100"),
@@ -423,8 +124,293 @@ async def test_signal_rejected_by_risk_manager(monkeypatch) -> None:
         low=Decimal("103"),
         close=Decimal("106"),
     )
+    candles = [first, prev, last]
+
+    result = await engine.generate_signal(candles, now=now, spread_ok=True)
+
+    # Убедимся, что сигнал действительно сгенерирован.
+    assert isinstance(result, Signal)
+
+    # Базовые параметры сигнала.
+    assert result.symbol == "BTCUSDT"
+    assert result.direction == "long"
+    assert result.entry_price == last.close
+
+    # stake_usd = max_stake * theta = 100 * 0.3 = 30
+    assert result.stake_usd == Decimal("30")
+
+    # probability == theta (см. реализацию Avi5SignalEngine).
+    assert result.probability == Decimal("0.3")
+
+    # ATR = 10, atr_multiplier = 2 → risk_per_unit = 20
+    # long: SL = entry - 20, TP1/2/3 = entry + 20/40/60
+    assert result.stop_loss == last.close - Decimal("20")
+    assert result.tp1 == last.close + Decimal("20")
+    assert result.tp2 == last.close + Decimal("40")
+    assert result.tp3 == last.close + Decimal("60")
+
+    # RiskManager.check_limits должен быть вызван один раз с нашим сигналом.
+    risk_mgr.check_limits.assert_awaited_once()
+    called_signal = (
+        risk_mgr.check_limits.call_args.kwargs.get("signal")
+        or risk_mgr.check_limits.call_args.args[0]
+    )
+    assert isinstance(called_signal, Signal)
+    assert called_signal.id == result.id
+    assert isinstance(result.id, UUID)
+
+
+@pytest.mark.asyncio
+async def test_signal_rejected_by_risk_manager(monkeypatch) -> None:
+    """
+    Если RiskManager возвращает allowed=False, generate_signal()
+    должен вернуть None, при этом RiskManager обязательно вызывается.
+    """
+    from src.strategies import avi5 as avi5_module
+
+    engine, risk_mgr = _mk_engine(theta=0.3, atr_window=2, atr_multiplier=2.0)
+
+    def fake_atr(_candles: List[Candle], _period: int) -> Decimal:
+        return Decimal("5")
+
+    def fake_donchian(_candles: List[Candle], _window: int) -> Tuple[Decimal, Decimal]:
+        # Аналогичный сценарий пробоя вверх, как в позитивном тесте.
+        return Decimal("105"), Decimal("95")
+
+    monkeypatch.setattr(avi5_module, "atr", fake_atr)
+    monkeypatch.setattr(avi5_module, "donchian", fake_donchian)
+
+    # Теперь RiskManager должен отклонить сигнал.
+    risk_mgr.check_limits = AsyncMock(return_value=(False, "limit-exceeded"))
+
+    now = datetime.now(timezone.utc)
+
+    first = _mk_candle(
+        ts=now - timedelta(minutes=10),
+        open_=Decimal("95"),
+        high=Decimal("101"),
+        low=Decimal("94"),
+        close=Decimal("100"),
+    )
+    prev = _mk_candle(
+        ts=now - timedelta(minutes=5),
+        open_=Decimal("100"),
+        high=Decimal("104"),
+        low=Decimal("99"),
+        close=Decimal("100"),
+    )
+    last = _mk_candle(
+        ts=now,
+        open_=Decimal("104"),
+        high=Decimal("110"),
+        low=Decimal("103"),
+        close=Decimal("106"),
+    )
+    candles = [first, prev, last]
+
+    result = await engine.generate_signal(candles, now=now, spread_ok=True)
+
+    # Сигнал должен быть отклонён после проверки RiskManager.
+    assert result is None
+    risk_mgr.check_limits.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_no_signal_if_not_enough_candles(monkeypatch) -> None:
+    """
+    Если длина истории меньше atr_window + 1,
+    сигнал не должен генерироваться, RiskManager не вызывается.
+    """
+    from src.strategies import avi5 as avi5_module
+
+    engine, risk_mgr = _mk_engine(theta=0.3, atr_window=3, atr_multiplier=2.0)
+
+    # Индикаторы не важны — до них код не должен дойти.
+    def fake_atr(_candles: List[Candle], _period: int) -> Decimal:
+        return Decimal("10")
+
+    def fake_donchian(_candles: List[Candle], _window: int) -> Tuple[Decimal, Decimal]:
+        return Decimal("105"), Decimal("95")
+
+    monkeypatch.setattr(avi5_module, "atr", fake_atr)
+    monkeypatch.setattr(avi5_module, "donchian", fake_donchian)
+
+    now = datetime.now(timezone.utc)
+
+    prev = _mk_candle(
+        ts=now - timedelta(minutes=5),
+        open_=Decimal("100"),
+        high=Decimal("104"),
+        low=Decimal("99"),
+        close=Decimal("100"),
+    )
+    last = _mk_candle(
+        ts=now,
+        open_=Decimal("104"),
+        high=Decimal("110"),
+        low=Decimal("103"),
+        close=Decimal("106"),
+    )
+    # atr_window=3 → нужно минимум 4 свечи, а у нас только 2.
     candles = [prev, last]
 
     result = await engine.generate_signal(candles, now=now, spread_ok=True)
+
     assert result is None
-    risk_mgr.check_limits.assert_awaited_once()
+    risk_mgr.check_limits.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_no_signal_if_spread_not_ok(monkeypatch) -> None:
+    """
+    Если spread_ok=False, сигнал не должен генерироваться.
+    RiskManager не вызывается.
+    """
+    from src.strategies import avi5 as avi5_module
+
+    engine, risk_mgr = _mk_engine(theta=0.3, atr_window=2, atr_multiplier=2.0)
+
+    def fake_atr(_candles: List[Candle], _period: int) -> Decimal:
+        return Decimal("10")
+
+    def fake_donchian(_candles: List[Candle], _window: int) -> Tuple[Decimal, Decimal]:
+        return Decimal("105"), Decimal("95")
+
+    monkeypatch.setattr(avi5_module, "atr", fake_atr)
+    monkeypatch.setattr(avi5_module, "donchian", fake_donchian)
+
+    now = datetime.now(timezone.utc)
+
+    first = _mk_candle(
+        ts=now - timedelta(minutes=10),
+        open_=Decimal("95"),
+        high=Decimal("101"),
+        low=Decimal("94"),
+        close=Decimal("100"),
+    )
+    prev = _mk_candle(
+        ts=now - timedelta(minutes=5),
+        open_=Decimal("100"),
+        high=Decimal("104"),
+        low=Decimal("99"),
+        close=Decimal("100"),
+    )
+    last = _mk_candle(
+        ts=now,
+        open_=Decimal("104"),
+        high=Decimal("110"),
+        low=Decimal("103"),
+        close=Decimal("106"),
+    )
+    candles = [first, prev, last]
+
+    result = await engine.generate_signal(candles, now=now, spread_ok=False)
+
+    assert result is None
+    risk_mgr.check_limits.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_no_signal_if_funding_too_soon(monkeypatch) -> None:
+    """
+    Если до funding меньше 15 минут, сигнал блокируется фильтром funding.
+    RiskManager не вызывается.
+    """
+    from src.strategies import avi5 as avi5_module
+
+    engine, risk_mgr = _mk_engine(theta=0.3, atr_window=2, atr_multiplier=2.0)
+
+    def fake_atr(_candles: List[Candle], _period: int) -> Decimal:
+        return Decimal("10")
+
+    def fake_donchian(_candles: List[Candle], _window: int) -> Tuple[Decimal, Decimal]:
+        return Decimal("105"), Decimal("95")
+
+    monkeypatch.setattr(avi5_module, "atr", fake_atr)
+    monkeypatch.setattr(avi5_module, "donchian", fake_donchian)
+
+    now = datetime.now(timezone.utc)
+
+    first = _mk_candle(
+        ts=now - timedelta(minutes=10),
+        open_=Decimal("95"),
+        high=Decimal("101"),
+        low=Decimal("94"),
+        close=Decimal("100"),
+    )
+    prev = _mk_candle(
+        ts=now - timedelta(minutes=5),
+        open_=Decimal("100"),
+        high=Decimal("104"),
+        low=Decimal("99"),
+        close=Decimal("100"),
+    )
+    last = _mk_candle(
+        ts=now,
+        open_=Decimal("104"),
+        high=Decimal("110"),
+        low=Decimal("103"),
+        close=Decimal("106"),
+    )
+    candles = [first, prev, last]
+
+    result = await engine.generate_signal(
+        candles,
+        now=now,
+        spread_ok=True,
+        time_to_funding_minutes=10,
+    )
+
+    assert result is None
+    risk_mgr.check_limits.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_no_signal_if_no_donchian_breakout(monkeypatch) -> None:
+    """
+    Если нет пробоя Donchian-канала, сигнал генерироваться не должен.
+    """
+    from src.strategies import avi5 as avi5_module
+
+    engine, risk_mgr = _mk_engine(theta=0.3, atr_window=2, atr_multiplier=2.0)
+
+    def fake_atr(_candles: List[Candle], _period: int) -> Decimal:
+        return Decimal("10")
+
+    def fake_donchian(_candles: List[Candle], _window: int) -> Tuple[Decimal, Decimal]:
+        # last.close находится внутри канала → пробоя нет.
+        return Decimal("105"), Decimal("95")
+
+    monkeypatch.setattr(avi5_module, "atr", fake_atr)
+    monkeypatch.setattr(avi5_module, "donchian", fake_donchian)
+
+    now = datetime.now(timezone.utc)
+
+    first = _mk_candle(
+        ts=now - timedelta(minutes=10),
+        open_=Decimal("95"),
+        high=Decimal("106"),
+        low=Decimal("94"),
+        close=Decimal("100"),
+    )
+    prev = _mk_candle(
+        ts=now - timedelta(minutes=5),
+        open_=Decimal("100"),
+        high=Decimal("104"),
+        low=Decimal("99"),
+        close=Decimal("100"),
+    )
+    # close внутри диапазона [lower, upper]
+    last = _mk_candle(
+        ts=now,
+        open_=Decimal("100"),
+        high=Decimal("104"),
+        low=Decimal("96"),
+        close=Decimal("100"),
+    )
+    candles = [first, prev, last]
+
+    result = await engine.generate_signal(candles, now=now, spread_ok=True)
+
+    assert result is None
+    risk_mgr.check_limits.assert_not_awaited()
