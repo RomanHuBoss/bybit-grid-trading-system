@@ -25,6 +25,10 @@ def _mk_candle(
 ) -> Candle:
     """
     Упрощённый конструктор 5-минутной свечи для тестов AVI-5.
+
+    Важно: это ConfirmedCandle, поэтому в самих тестах необходимо
+    следить за тем, чтобы close_time всегда был <= now,
+    который передаётся в generate_signal.
     """
     return Candle(
         symbol="BTCUSDT",
@@ -48,7 +52,7 @@ def _mk_engine(
     """
     Сконструировать Avi5SignalEngine с мокнутым RiskManager.
 
-    Важно: конфиг по умолчанию согласован с core.models.AVI5Config и
+    Конфиг по умолчанию согласован с core.models.AVI5Config и
     текущей реализацией Avi5SignalEngine.
     """
     avi_cfg = AVI5Config(
@@ -100,31 +104,36 @@ async def test_generate_long_signal_and_passed_risk_manager(monkeypatch) -> None
     monkeypatch.setattr(avi5_module, "atr", fake_atr)
     monkeypatch.setattr(avi5_module, "donchian", fake_donchian)
 
-    now = datetime.now(timezone.utc)
+    # Фиксируем базовое время, чтобы не поймать дребезг по микросекундам.
+    base = datetime.now(timezone.utc)
 
     # Нужно минимум atr_window + 1 свечей → 3 штуки при atr_window=2.
+    # Раскладываем их в прошлом, последняя закрывается в момент base.
     first = _mk_candle(
-        ts=now - timedelta(minutes=10),
+        ts=base - timedelta(minutes=15),
         open_=Decimal("95"),
         high=Decimal("101"),
         low=Decimal("94"),
         close=Decimal("100"),
     )
     prev = _mk_candle(
-        ts=now - timedelta(minutes=5),
+        ts=base - timedelta(minutes=10),
         open_=Decimal("100"),
         high=Decimal("104"),
         low=Decimal("99"),
         close=Decimal("100"),
     )
     last = _mk_candle(
-        ts=now,
+        ts=base - timedelta(minutes=5),
         open_=Decimal("104"),
         high=Decimal("110"),
         low=Decimal("103"),
         close=Decimal("106"),
     )
     candles = [first, prev, last]
+
+    # now должен быть строго позже close_time последней свечи
+    now = last.close_time + timedelta(seconds=1)
 
     result = await engine.generate_signal(candles, now=now, spread_ok=True)
 
@@ -180,33 +189,35 @@ async def test_signal_rejected_by_risk_manager(monkeypatch) -> None:
     monkeypatch.setattr(avi5_module, "atr", fake_atr)
     monkeypatch.setattr(avi5_module, "donchian", fake_donchian)
 
-    # Теперь RiskManager должен отклонить сигнал.
+    # RiskManager должен отклонить сигнал.
     risk_mgr.check_limits = AsyncMock(return_value=(False, "limit-exceeded"))
 
-    now = datetime.now(timezone.utc)
+    base = datetime.now(timezone.utc)
 
     first = _mk_candle(
-        ts=now - timedelta(minutes=10),
+        ts=base - timedelta(minutes=15),
         open_=Decimal("95"),
         high=Decimal("101"),
         low=Decimal("94"),
         close=Decimal("100"),
     )
     prev = _mk_candle(
-        ts=now - timedelta(minutes=5),
+        ts=base - timedelta(minutes=10),
         open_=Decimal("100"),
         high=Decimal("104"),
         low=Decimal("99"),
         close=Decimal("100"),
     )
     last = _mk_candle(
-        ts=now,
+        ts=base - timedelta(minutes=5),
         open_=Decimal("104"),
         high=Decimal("110"),
         low=Decimal("103"),
         close=Decimal("106"),
     )
     candles = [first, prev, last]
+
+    now = last.close_time + timedelta(seconds=1)
 
     result = await engine.generate_signal(candles, now=now, spread_ok=True)
 
@@ -235,17 +246,17 @@ async def test_no_signal_if_not_enough_candles(monkeypatch) -> None:
     monkeypatch.setattr(avi5_module, "atr", fake_atr)
     monkeypatch.setattr(avi5_module, "donchian", fake_donchian)
 
-    now = datetime.now(timezone.utc)
+    base = datetime.now(timezone.utc)
 
     prev = _mk_candle(
-        ts=now - timedelta(minutes=5),
+        ts=base - timedelta(minutes=10),
         open_=Decimal("100"),
         high=Decimal("104"),
         low=Decimal("99"),
         close=Decimal("100"),
     )
     last = _mk_candle(
-        ts=now,
+        ts=base - timedelta(minutes=5),
         open_=Decimal("104"),
         high=Decimal("110"),
         low=Decimal("103"),
@@ -253,6 +264,8 @@ async def test_no_signal_if_not_enough_candles(monkeypatch) -> None:
     )
     # atr_window=3 → нужно минимум 4 свечи, а у нас только 2.
     candles = [prev, last]
+
+    now = last.close_time + timedelta(seconds=1)
 
     result = await engine.generate_signal(candles, now=now, spread_ok=True)
 
@@ -279,30 +292,32 @@ async def test_no_signal_if_spread_not_ok(monkeypatch) -> None:
     monkeypatch.setattr(avi5_module, "atr", fake_atr)
     monkeypatch.setattr(avi5_module, "donchian", fake_donchian)
 
-    now = datetime.now(timezone.utc)
+    base = datetime.now(timezone.utc)
 
     first = _mk_candle(
-        ts=now - timedelta(minutes=10),
+        ts=base - timedelta(minutes=15),
         open_=Decimal("95"),
         high=Decimal("101"),
         low=Decimal("94"),
         close=Decimal("100"),
     )
     prev = _mk_candle(
-        ts=now - timedelta(minutes=5),
+        ts=base - timedelta(minutes=10),
         open_=Decimal("100"),
         high=Decimal("104"),
         low=Decimal("99"),
         close=Decimal("100"),
     )
     last = _mk_candle(
-        ts=now,
+        ts=base - timedelta(minutes=5),
         open_=Decimal("104"),
         high=Decimal("110"),
         low=Decimal("103"),
         close=Decimal("106"),
     )
     candles = [first, prev, last]
+
+    now = last.close_time + timedelta(seconds=1)
 
     result = await engine.generate_signal(candles, now=now, spread_ok=False)
 
@@ -329,30 +344,32 @@ async def test_no_signal_if_funding_too_soon(monkeypatch) -> None:
     monkeypatch.setattr(avi5_module, "atr", fake_atr)
     monkeypatch.setattr(avi5_module, "donchian", fake_donchian)
 
-    now = datetime.now(timezone.utc)
+    base = datetime.now(timezone.utc)
 
     first = _mk_candle(
-        ts=now - timedelta(minutes=10),
+        ts=base - timedelta(minutes=15),
         open_=Decimal("95"),
         high=Decimal("101"),
         low=Decimal("94"),
         close=Decimal("100"),
     )
     prev = _mk_candle(
-        ts=now - timedelta(minutes=5),
+        ts=base - timedelta(minutes=10),
         open_=Decimal("100"),
         high=Decimal("104"),
         low=Decimal("99"),
         close=Decimal("100"),
     )
     last = _mk_candle(
-        ts=now,
+        ts=base - timedelta(minutes=5),
         open_=Decimal("104"),
         high=Decimal("110"),
         low=Decimal("103"),
         close=Decimal("106"),
     )
     candles = [first, prev, last]
+
+    now = last.close_time + timedelta(seconds=1)
 
     result = await engine.generate_signal(
         candles,
@@ -384,17 +401,17 @@ async def test_no_signal_if_no_donchian_breakout(monkeypatch) -> None:
     monkeypatch.setattr(avi5_module, "atr", fake_atr)
     monkeypatch.setattr(avi5_module, "donchian", fake_donchian)
 
-    now = datetime.now(timezone.utc)
+    base = datetime.now(timezone.utc)
 
     first = _mk_candle(
-        ts=now - timedelta(minutes=10),
+        ts=base - timedelta(minutes=15),
         open_=Decimal("95"),
         high=Decimal("106"),
         low=Decimal("94"),
         close=Decimal("100"),
     )
     prev = _mk_candle(
-        ts=now - timedelta(minutes=5),
+        ts=base - timedelta(minutes=10),
         open_=Decimal("100"),
         high=Decimal("104"),
         low=Decimal("99"),
@@ -402,13 +419,15 @@ async def test_no_signal_if_no_donchian_breakout(monkeypatch) -> None:
     )
     # close внутри диапазона [lower, upper]
     last = _mk_candle(
-        ts=now,
+        ts=base - timedelta(minutes=5),
         open_=Decimal("100"),
         high=Decimal("104"),
         low=Decimal("96"),
         close=Decimal("100"),
     )
     candles = [first, prev, last]
+
+    now = last.close_time + timedelta(seconds=1)
 
     result = await engine.generate_signal(candles, now=now, spread_ok=True)
 
