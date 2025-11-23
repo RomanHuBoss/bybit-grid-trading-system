@@ -1,5 +1,5 @@
 # --------
-# Builder stage: install build deps, Poetry and Python dependencies
+# Builder stage: install build deps and Python dependencies
 # --------
 FROM python:3.12-slim AS builder
 
@@ -14,16 +14,26 @@ RUN apt-get update && \
         libpq-dev \
     && rm -rf /var/lib/apt/lists/*
 
+# Рабочий каталог сборки
 WORKDIR /app
 
-# Устанавливаем Poetry
-RUN pip install --no-cache-dir poetry
+# Копируем заранее сгенерированный requirements.txt
+COPY requirements.txt ./
 
-# Копируем только файлы зависимостей для кэша слоёв
-COPY pyproject.toml poetry.lock* ./
+# Конвертируем requirements.txt в UTF-8 (на случай, если он в UTF-16),
+# чтобы pip мог его корректно прочитать внутри контейнера
+RUN python - << 'PY'
+from pathlib import Path
 
-# Экспортируем зависимости в requirements.txt
-RUN poetry export -f requirements.txt -o requirements.txt --without-hashes
+path = Path("requirements.txt")
+data = path.read_bytes()
+try:
+    text = data.decode("utf-16")
+except UnicodeError:
+    # уже UTF-8 или другая совместимая кодировка
+    text = data.decode()
+path.write_text(text, encoding="utf-8")
+PY
 
 # Устанавливаем зависимости в user-окружение (см. спецификацию)
 RUN pip install --no-cache-dir --user -r requirements.txt
